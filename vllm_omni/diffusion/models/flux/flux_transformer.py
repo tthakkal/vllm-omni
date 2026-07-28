@@ -96,7 +96,6 @@ class ColumnParallelApproxGELU(nn.Module):
         )
         self.approximate = approximate
 
-    @torch._dynamo.disable
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.proj(x)
         return F.gelu(x, approximate=self.approximate)
