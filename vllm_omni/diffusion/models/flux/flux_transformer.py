@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
