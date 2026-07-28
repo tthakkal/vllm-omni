@@ -52,6 +52,11 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 logger = init_logger(__name__)
 
 
+def _is_xpu_device() -> bool:
+    """Check if current device is Intel XPU."""
+    return hasattr(torch, "xpu") and torch.xpu.is_available()
+
+
 def _join_prefix(prefix: str, name: str) -> str:
     return f"{prefix}.{name}" if prefix else name
 
@@ -63,7 +68,10 @@ def _get_tensor_parallel_size(parallel_config: DiffusionParallelConfig | None) -
 
 
 def _use_sharded_single_block_path(parallel_config: DiffusionParallelConfig | None) -> bool:
-    # Flux2-like behavior: select path from model parallel configuration.
+    # XPU-specific optimization: select sharded path for better performance on Intel XPU.
+    # Only enable for XPU devices and when tensor parallelism is available.
+    if not _is_xpu_device():
+        return False
     return _get_tensor_parallel_size(parallel_config) > 1
 
 
@@ -363,11 +371,14 @@ class FluxAttention(torch.nn.Module):
             value = torch.cat([encoder_value, value], dim=1)
 
         # SP-aware single-stream path: attend from image tokens with text as joint context.
+        # XPU-specific optimization enabled only for Intel XPU devices
         text_seq_len = kwargs.get("text_seq_len")
         use_sp_single_stream = bool(kwargs.get("use_sp_single_stream", False))
+        is_xpu = hidden_states.device.type == "xpu"
         if (
             encoder_hidden_states is None
             and use_sp_single_stream
+            and is_xpu
             and text_seq_len is not None
             and image_rotary_emb is not None
         ):
@@ -622,9 +633,12 @@ class FluxSingleTransformerBlock(nn.Module):
         text_seq_len = encoder_hidden_states.shape[1]
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
+        # XPU-specific optimization: sequence parallel single stream
+        is_xpu = hidden_states.device.type == "xpu"
         sp_size = self.parallel_config.sequence_parallel_size if self.parallel_config is not None else None
         use_sp_single_stream = (
-            sp_size is not None
+            is_xpu
+            and sp_size is not None
             and sp_size > 1
             and is_forward_context_available()
             and not get_forward_context().split_text_embed_in_sp
@@ -678,6 +692,7 @@ class FluxPosEmbed(nn.Module):
         pos = ids.float()
         is_mps = ids.device.type == "mps"
         is_npu = ids.device.type == "npu"
+        is_xpu = ids.device.type == "xpu"
         freqs_dtype = torch.float32 if (is_mps or is_npu) else torch.float64
         for i in range(n_axes):
             freqs_cis = get_1d_rotary_pos_embed(
@@ -691,12 +706,18 @@ class FluxPosEmbed(nn.Module):
             sin_out.append(freqs_cis.imag)
         freqs_cos = torch.cat(cos_out, dim=-1)
         freqs_sin = torch.cat(sin_out, dim=-1)
-        if target_dtype is None:
+
+        # XPU-specific optimization: fused device + dtype conversion to avoid intermediate copy
+        if is_xpu and target_dtype is not None:
+            if freqs_cos.device != ids.device or freqs_cos.dtype != target_dtype:
+                freqs_cos = freqs_cos.to(device=ids.device, dtype=target_dtype)
+                freqs_sin = freqs_sin.to(device=ids.device, dtype=target_dtype)
+        elif target_dtype is None:
             if freqs_cos.device != ids.device:
                 freqs_cos = freqs_cos.to(ids.device)
                 freqs_sin = freqs_sin.to(ids.device)
         else:
-            # Fuse device + dtype conversion to avoid an extra intermediate copy.
+            # Standard path for non-XPU devices
             if freqs_cos.device != ids.device or freqs_cos.dtype != target_dtype:
                 freqs_cos = freqs_cos.to(device=ids.device, dtype=target_dtype)
                 freqs_sin = freqs_sin.to(device=ids.device, dtype=target_dtype)
