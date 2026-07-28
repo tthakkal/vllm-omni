@@ -3,6 +3,7 @@
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -51,10 +52,41 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
 logger = init_logger(__name__)
 
+# Enable sharded projections for improved multi-GPU performance
+_FLUX_SHARDED_PROJ_ENV = "VLLM_OMNI_FLUX1_SHARDED_PROJ"
+_FLUX_SHARDED_PROJ_ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
+_FLUX_SHARDED_PROJ_DISABLED_VALUES = frozenset({"0", "false", "no", "off", "disabled", "disable"})
 
-def _is_xpu_device() -> bool:
-    """Check if current device is Intel XPU."""
-    return hasattr(torch, "xpu") and torch.xpu.is_available()
+
+def _should_use_flux_optimizations() -> bool:
+    """Check if FLUX sharded projection optimizations should be enabled.
+
+    Sharded projections improve inference performance through efficient multi-GPU
+    execution with reduced memory footprint per GPU. Controlled via environment
+    variable VLLM_OMNI_FLUX1_SHARDED_PROJ:
+    - Not set (default): Disabled - uses standard replicated execution
+    - Set to '1', 'true', 'yes', 'on': Enable sharded projections on any device
+    - Set to '0', 'false', 'no', 'off', 'disabled', 'disable': Disable sharding
+
+    Returns:
+        bool: True if sharded projection optimization should be enabled, False otherwise
+    """
+    env_value = os.environ.get(_FLUX_SHARDED_PROJ_ENV, "").lower()
+
+    # Empty string (not set) means disabled by default
+    if not env_value:
+        return False
+
+    # Explicit disable
+    if env_value in _FLUX_SHARDED_PROJ_DISABLED_VALUES:
+        return False
+
+    # Explicit enable
+    if env_value in _FLUX_SHARDED_PROJ_ENABLED_VALUES:
+        return True
+
+    # Unknown value: default to disabled
+    return False
 
 
 def _join_prefix(prefix: str, name: str) -> str:
@@ -68,14 +100,11 @@ def _get_tensor_parallel_size(parallel_config: DiffusionParallelConfig | None) -
 
 
 def _use_sharded_single_block_path(parallel_config: DiffusionParallelConfig | None) -> bool:
-    # XPU-specific optimization: select sharded path for better performance on Intel XPU.
-    # Only enable for XPU devices and when tensor parallelism is available.
-    if not _is_xpu_device():
+    if not _should_use_flux_optimizations():
         return False
     return _get_tensor_parallel_size(parallel_config) > 1
 
 
-@torch._dynamo.disable
 def _apply_row_parallel_local(layer: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
     bias = layer.bias if get_tensor_model_parallel_rank() == 0 else None
     return layer.quant_method.apply(layer, x, bias)
@@ -143,7 +172,6 @@ class FluxSingleBlockOutput(nn.Module):
             prefix=_join_prefix(prefix, "mlp_proj"),
         )
 
-    @torch._dynamo.disable
     def forward(self, attn_hidden_states: torch.Tensor, mlp_hidden_states: torch.Tensor) -> torch.Tensor:
         attn_output = _apply_row_parallel_local(self.attn_proj, attn_hidden_states)
         mlp_output = _apply_row_parallel_local(self.mlp_proj, mlp_hidden_states)
@@ -370,15 +398,15 @@ class FluxAttention(torch.nn.Module):
             key = torch.cat([encoder_key, key], dim=1)
             value = torch.cat([encoder_value, value], dim=1)
 
-        # SP-aware single-stream path: attend from image tokens with text as joint context.
-        # XPU-specific optimization enabled only for Intel XPU devices
+        # Sharded projection optimization: SP-aware single-stream path
+        # Attend from image tokens with text as joint context
         text_seq_len = kwargs.get("text_seq_len")
         use_sp_single_stream = bool(kwargs.get("use_sp_single_stream", False))
-        is_xpu = hidden_states.device.type == "xpu"
+        enable_optimizations = _should_use_flux_optimizations()
         if (
             encoder_hidden_states is None
             and use_sp_single_stream
-            and is_xpu
+            and enable_optimizations
             and text_seq_len is not None
             and image_rotary_emb is not None
         ):
@@ -633,11 +661,11 @@ class FluxSingleTransformerBlock(nn.Module):
         text_seq_len = encoder_hidden_states.shape[1]
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
-        # XPU-specific optimization: sequence parallel single stream
-        is_xpu = hidden_states.device.type == "xpu"
+        # Sharded projection optimization with sequence parallel support
+        # Efficient single-stream joint attention execution
         sp_size = self.parallel_config.sequence_parallel_size if self.parallel_config is not None else None
         use_sp_single_stream = (
-            is_xpu
+            _should_use_flux_optimizations()
             and sp_size is not None
             and sp_size > 1
             and is_forward_context_available()
@@ -692,7 +720,6 @@ class FluxPosEmbed(nn.Module):
         pos = ids.float()
         is_mps = ids.device.type == "mps"
         is_npu = ids.device.type == "npu"
-        is_xpu = ids.device.type == "xpu"
         freqs_dtype = torch.float32 if (is_mps or is_npu) else torch.float64
         for i in range(n_axes):
             freqs_cis = get_1d_rotary_pos_embed(
@@ -707,20 +734,14 @@ class FluxPosEmbed(nn.Module):
         freqs_cos = torch.cat(cos_out, dim=-1)
         freqs_sin = torch.cat(sin_out, dim=-1)
 
-        # XPU-specific optimization: fused device + dtype conversion to avoid intermediate copy
-        if is_xpu and target_dtype is not None:
-            if freqs_cos.device != ids.device or freqs_cos.dtype != target_dtype:
-                freqs_cos = freqs_cos.to(device=ids.device, dtype=target_dtype)
-                freqs_sin = freqs_sin.to(device=ids.device, dtype=target_dtype)
-        elif target_dtype is None:
-            if freqs_cos.device != ids.device:
-                freqs_cos = freqs_cos.to(ids.device)
-                freqs_sin = freqs_sin.to(ids.device)
+        # Sharded projection optimization: fused device + dtype conversion
+        # Reduces intermediate tensor copies during rotary embedding computation
+        if target_dtype is not None:
+            freqs_cos = freqs_cos.to(device=ids.device, dtype=target_dtype)
+            freqs_sin = freqs_sin.to(device=ids.device, dtype=target_dtype)
         else:
-            # Standard path for non-XPU devices
-            if freqs_cos.device != ids.device or freqs_cos.dtype != target_dtype:
-                freqs_cos = freqs_cos.to(device=ids.device, dtype=target_dtype)
-                freqs_sin = freqs_sin.to(device=ids.device, dtype=target_dtype)
+            freqs_cos = freqs_cos.to(ids.device)
+            freqs_sin = freqs_sin.to(ids.device)
         return freqs_cos, freqs_sin
 
 
