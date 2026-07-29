@@ -41,8 +41,6 @@ if TYPE_CHECKING:
 
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput, SequenceParallelOutput
-from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.adalayernorm import (
     AdaLayerNormContinuous,
     AdaLayerNormZero,
@@ -52,7 +50,6 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 
 logger = init_logger(__name__)
 
-# Enable sharded projections for improved multi-GPU performance
 _FLUX_SHARDED_PROJ_ENV = "VLLM_OMNI_FLUX1_SHARDED_PROJ"
 _FLUX_SHARDED_PROJ_ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
 _FLUX_SHARDED_PROJ_DISABLED_VALUES = frozenset({"0", "false", "no", "off", "disabled", "disable"})
@@ -73,19 +70,15 @@ def _should_use_flux_optimizations() -> bool:
     """
     env_value = os.environ.get(_FLUX_SHARDED_PROJ_ENV, "").lower()
 
-    # Empty string (not set) means disabled by default
     if not env_value:
         return False
 
-    # Explicit disable
     if env_value in _FLUX_SHARDED_PROJ_DISABLED_VALUES:
         return False
 
-    # Explicit enable
     if env_value in _FLUX_SHARDED_PROJ_ENABLED_VALUES:
         return True
 
-    # Unknown value: default to disabled
     return False
 
 
@@ -104,35 +97,6 @@ def _use_sharded_single_block_path(parallel_config: DiffusionParallelConfig | No
 def _apply_row_parallel_local(layer: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
     bias = layer.bias if get_tensor_model_parallel_rank() == 0 else None
     return layer.quant_method.apply(layer, x, bias)
-
-
-def _apply_rope_split(
-    image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
-    query: torch.Tensor,
-    key: torch.Tensor,
-    text_seq_len: int,
-    rope: RotaryEmbedding,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply rotary embeddings with text/image split."""
-    cos, sin = image_rotary_emb
-    if cos.dtype != query.dtype:
-        cos = cos.to(query.dtype)
-    if sin.dtype != query.dtype:
-        sin = sin.to(query.dtype)
-    txt_cos, img_cos = cos[:text_seq_len], cos[text_seq_len:]
-    txt_sin, img_sin = sin[:text_seq_len], sin[text_seq_len:]
-
-    img_query = query[:, text_seq_len:]
-    img_key = key[:, text_seq_len:]
-    text_query = query[:, :text_seq_len]
-    text_key = key[:, :text_seq_len]
-
-    img_query = rope(img_query, img_cos, img_sin)
-    img_key = rope(img_key, img_cos, img_sin)
-    text_query = rope(text_query, txt_cos, txt_sin)
-    text_key = rope(text_key, txt_cos, txt_sin)
-
-    return torch.cat([text_query, img_query], dim=1), torch.cat([text_key, img_key], dim=1)
 
 
 def _compute_image_rotary_emb(
@@ -239,14 +203,30 @@ class FluxSingleBlockOutput(nn.Module):
         *,
         start_dim: int = 0,
     ) -> None:
-        param = getattr(proj, weight_name)
-        split_dim = getattr(param, "input_dim", 0)
+        param = getattr(proj, weight_name, None)
+        if param is None:
+            raise ValueError(
+                f"Cannot load '{weight_name}' into the sharded FLUX proj_out: "
+                f"{type(proj).__name__} has no such parameter. This checkpoint is not "
+                f"supported by the sharded projection path; unset "
+                f"{_FLUX_SHARDED_PROJ_ENV} to load it with replicated projections."
+            )
+
+        weight_loader = getattr(param, "weight_loader", default_weight_loader)
+
+        # Per-tensor / per-output-channel quantization scales carry no input_dim and are
+        # not split across the attn/mlp halves - they must be replicated verbatim.
+        # Narrowing them (the old unconditional path) yielded shard_size == 0.
+        if not hasattr(param, "input_dim"):
+            weight_loader(param, loaded_weight)
+            return
+
+        split_dim = param.input_dim
         total_width = self.attn_dim + self.mlp_dim
         dim_size = loaded_weight.shape[split_dim]
         start_idx = dim_size * start_dim // total_width
         shard_size = dim_size * logical_width // total_width
         loaded_weight = loaded_weight.narrow(split_dim, start_idx, shard_size)
-        weight_loader = getattr(param, "weight_loader", default_weight_loader)
         weight_loader(param, loaded_weight)
 
     def loaded_parameter_names(self, weight_name: str) -> list[str]:
@@ -405,7 +385,7 @@ class FluxAttention(torch.nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         precomputed_qkv: torch.Tensor | None = kwargs.get("precomputed_qkv")
         if precomputed_qkv is None:
-            qkv, _ = self.to_qkv(hidden_states)
+            qkv, _ = self.to_qkv(hidden_states.contiguous())
         else:
             qkv = precomputed_qkv
         q_size = self.to_qkv.num_heads * self.head_dim
@@ -420,6 +400,7 @@ class FluxAttention(torch.nn.Module):
         key = self.norm_k(key)
 
         if self.added_kv_proj_dim is not None:
+            encoder_hidden_states = encoder_hidden_states.contiguous()
             encoder_qkv, _ = self.add_kv_proj(encoder_hidden_states)
             add_q_size = self.add_kv_proj.num_heads * self.head_dim
             add_kv_size = self.add_kv_proj.num_kv_heads * self.head_dim
@@ -438,54 +419,20 @@ class FluxAttention(torch.nn.Module):
             key = torch.cat([encoder_key, key], dim=1)
             value = torch.cat([encoder_value, value], dim=1)
 
-        # Sharded projection optimization: SP-aware single-stream path
-        # Attend from image tokens with text as joint context
-        text_seq_len = kwargs.get("text_seq_len")
-        use_sp_single_stream = bool(kwargs.get("use_sp_single_stream", False))
-        enable_optimizations = _should_use_flux_optimizations()
-        if (
-            encoder_hidden_states is None
-            and use_sp_single_stream
-            and enable_optimizations
-            and text_seq_len is not None
-            and image_rotary_emb is not None
-        ):
-            query, key = _apply_rope_split(image_rotary_emb, query, key, text_seq_len, self.rope)
-            img_query = query[:, text_seq_len:]
-            img_key = key[:, text_seq_len:]
-            text_query = query[:, :text_seq_len]
-            text_key = key[:, :text_seq_len]
-            text_value = value[:, :text_seq_len]
+        query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)  # [S, D/2]
 
-            attn_metadata = AttentionMetadata(
-                joint_query=text_query,
-                joint_key=text_key,
-                joint_value=text_value,
-                joint_strategy="front",
-            )
-            hidden_states_mask: torch.Tensor | None = kwargs.get("hidden_states_mask", None)
-            encoder_hidden_states_mask: torch.Tensor | None = kwargs.get("encoder_hidden_states_mask", None)
-            if hidden_states_mask is not None:
-                attn_metadata.attn_mask = hidden_states_mask
-            if encoder_hidden_states_mask is not None:
-                attn_metadata.joint_attn_mask = encoder_hidden_states_mask
+        attn_metadata = None
+        if attention_mask is not None:
+            if attention_mask.dim() == 3:
+                attention_mask = attention_mask.unsqueeze(1)
+            attn_metadata = AttentionMetadata(attn_mask=attention_mask)
 
-            hidden_states = self.attn(img_query, img_key, value[:, text_seq_len:], attn_metadata)
-        else:
-            query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)  # [S, D/2]
-
-            attn_metadata = None
-            if attention_mask is not None:
-                if attention_mask.dim() == 3:
-                    attention_mask = attention_mask.unsqueeze(1)
-                attn_metadata = AttentionMetadata(attn_mask=attention_mask)
-
-            hidden_states = self.attn(
-                query,
-                key,
-                value,
-                attn_metadata,
-            )
+        hidden_states = self.attn(
+            query,
+            key,
+            value,
+            attn_metadata,
+        )
         hidden_states = hidden_states.flatten(2, 3)
         if hidden_states.dtype != query.dtype:
             hidden_states = hidden_states.to(query.dtype)
@@ -496,8 +443,10 @@ class FluxAttention(torch.nn.Module):
                 [encoder_seq_len, hidden_states.shape[1] - encoder_seq_len],
                 dim=1,
             )
-            hidden_states = self.to_out[0](hidden_states)
-            encoder_hidden_states = self.to_add_out(encoder_hidden_states)
+            # Contiguous for FP8 quantization in RowParallelLinear: the dim=1 split above
+            # yields a non-contiguous view for batch > 1, which corrupts FP8 numerics.
+            hidden_states = self.to_out[0](hidden_states.contiguous())
+            encoder_hidden_states = self.to_add_out(encoder_hidden_states.contiguous())
             hidden_states = self.to_out[1](hidden_states)
 
             return hidden_states, encoder_hidden_states
@@ -565,7 +514,6 @@ class FluxTransformerBlock(nn.Module):
         )
         joint_attention_kwargs = joint_attention_kwargs or {}
 
-        # Attention.
         attention_outputs = self.attn(
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
@@ -578,7 +526,6 @@ class FluxTransformerBlock(nn.Module):
         elif len(attention_outputs) == 3:
             attn_output, context_attn_output, ip_attn_output = attention_outputs
 
-        # Process attention outputs for the `hidden_states`.
         attn_output = gate_msa.unsqueeze(1) * attn_output
         hidden_states = hidden_states + attn_output
 
@@ -592,7 +539,6 @@ class FluxTransformerBlock(nn.Module):
         if len(attention_outputs) == 3:
             hidden_states = hidden_states + ip_attn_output
 
-        # Process attention outputs for the `encoder_hidden_states`.
         context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
         encoder_hidden_states = encoder_hidden_states + context_attn_output
 
@@ -688,17 +634,6 @@ class FluxSingleTransformerBlock(nn.Module):
         text_seq_len = encoder_hidden_states.shape[1]
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 
-        # Sharded projection optimization with sequence parallel support
-        # Efficient single-stream joint attention execution
-        sp_size = self.parallel_config.sequence_parallel_size if self.parallel_config is not None else None
-        use_sp_single_stream = (
-            _should_use_flux_optimizations()
-            and sp_size is not None
-            and sp_size > 1
-            and is_forward_context_available()
-            and not get_forward_context().split_text_embed_in_sp
-        )
-
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
         qkv, mlp_hidden_states = self.to_qkv_mlp_proj(norm_hidden_states)
@@ -706,8 +641,6 @@ class FluxSingleTransformerBlock(nn.Module):
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
             image_rotary_emb=image_rotary_emb,
-            text_seq_len=text_seq_len,
-            use_sp_single_stream=use_sp_single_stream,
             precomputed_qkv=qkv,
             **joint_attention_kwargs,
         )
@@ -761,8 +694,6 @@ class FluxPosEmbed(nn.Module):
         freqs_cos = torch.cat(cos_out, dim=-1)
         freqs_sin = torch.cat(sin_out, dim=-1)
 
-        # Sharded projection optimization: fused device + dtype conversion
-        # Reduces intermediate tensor copies during rotary embedding computation
         if target_dtype is not None:
             freqs_cos = freqs_cos.to(device=ids.device, dtype=target_dtype)
             freqs_sin = freqs_sin.to(device=ids.device, dtype=target_dtype)
@@ -816,12 +747,10 @@ class FluxTransformer2DModel(nn.Module):
     # used for torch compile optimizations
     _repeated_blocks = ["FluxTransformerBlock", "FluxSingleTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
-    _sp_plan = {
-        "": {
-            "hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True),
-        },
-        "proj_out": SequenceParallelOutput(gather_dim=1, expected_dims=3),
-    }
+    # No _sp_plan: FLUX computes image_rotary_emb via a free function over concatenated
+    # txt+img ids, so there is no module to hook for sharding the RoPE freqs (unlike
+    # FLUX2's Flux2RopePrepare). Sharding hidden_states alone desyncs hidden_states from
+    # image_rotary_emb and crashes in apply_rope_to_qk.
 
     @staticmethod
     def _is_transformer_block(name: str, module) -> bool:
@@ -953,11 +882,6 @@ class FluxTransformer2DModel(nn.Module):
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
             `tuple` where the first element is the sample tensor.
         """
-
-        if self.parallel_config is not None:
-            sp_size = self.parallel_config.sequence_parallel_size
-            if sp_size is not None and sp_size > 1 and is_forward_context_available():
-                get_forward_context().split_text_embed_in_sp = False
 
         hidden_states = self.x_embedder(hidden_states)
         timestep = timestep.to(device=hidden_states.device, dtype=hidden_states.dtype) * 1000
