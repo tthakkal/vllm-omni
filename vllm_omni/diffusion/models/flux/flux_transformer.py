@@ -89,10 +89,6 @@ def _should_use_flux_optimizations() -> bool:
     return False
 
 
-def _join_prefix(prefix: str, name: str) -> str:
-    return f"{prefix}.{name}" if prefix else name
-
-
 def _get_tensor_parallel_size(parallel_config: DiffusionParallelConfig | None) -> int:
     if parallel_config is not None:
         return int(parallel_config.tensor_parallel_size)
@@ -108,6 +104,50 @@ def _use_sharded_single_block_path(parallel_config: DiffusionParallelConfig | No
 def _apply_row_parallel_local(layer: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
     bias = layer.bias if get_tensor_model_parallel_rank() == 0 else None
     return layer.quant_method.apply(layer, x, bias)
+
+
+def _apply_rope_split(
+    image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
+    query: torch.Tensor,
+    key: torch.Tensor,
+    text_seq_len: int,
+    rope: RotaryEmbedding,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply rotary embeddings with text/image split."""
+    cos, sin = image_rotary_emb
+    if cos.dtype != query.dtype:
+        cos = cos.to(query.dtype)
+    if sin.dtype != query.dtype:
+        sin = sin.to(query.dtype)
+    txt_cos, img_cos = cos[:text_seq_len], cos[text_seq_len:]
+    txt_sin, img_sin = sin[:text_seq_len], sin[text_seq_len:]
+
+    img_query = query[:, text_seq_len:]
+    img_key = key[:, text_seq_len:]
+    text_query = query[:, :text_seq_len]
+    text_key = key[:, :text_seq_len]
+
+    img_query = rope(img_query, img_cos, img_sin)
+    img_key = rope(img_key, img_cos, img_sin)
+    text_query = rope(text_query, txt_cos, txt_sin)
+    text_key = rope(text_key, txt_cos, txt_sin)
+
+    return torch.cat([text_query, img_query], dim=1), torch.cat([text_key, img_key], dim=1)
+
+
+def _compute_image_rotary_emb(
+    pos_embed: "FluxPosEmbed",
+    txt_ids: torch.Tensor,
+    img_ids: torch.Tensor,
+    target_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute rotary embeddings for image tokens with device/dtype handling."""
+    ids = torch.cat((txt_ids, img_ids), dim=0)
+    if is_torch_npu_available():
+        freqs_cos, freqs_sin = pos_embed(ids.cpu())
+        return freqs_cos.npu(), freqs_sin.npu()
+    else:
+        return pos_embed(ids, target_dtype=target_dtype)
 
 
 class ColumnParallelApproxGELU(nn.Module):
@@ -129,7 +169,7 @@ class ColumnParallelApproxGELU(nn.Module):
             gather_output=False,
             return_bias=False,
             quant_config=quant_config,
-            prefix=_join_prefix(prefix, "proj"),
+            prefix=f"{prefix}.proj",
         )
         self.approximate = approximate
 
@@ -160,7 +200,7 @@ class FluxSingleBlockOutput(nn.Module):
             input_is_parallel=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix=_join_prefix(prefix, "attn_proj"),
+            prefix=f"{prefix}.attn_proj",
         )
         self.mlp_proj = RowParallelLinear(
             mlp_dim,
@@ -169,7 +209,7 @@ class FluxSingleBlockOutput(nn.Module):
             input_is_parallel=True,
             return_bias=False,
             quant_config=quant_config,
-            prefix=_join_prefix(prefix, "mlp_proj"),
+            prefix=f"{prefix}.mlp_proj",
         )
 
     def forward(self, attn_hidden_states: torch.Tensor, mlp_hidden_states: torch.Tensor) -> torch.Tensor:
@@ -241,7 +281,7 @@ class FeedForward(nn.Module):
                 approximate="tanh",
                 bias=bias,
                 quant_config=quant_config,
-                prefix=_join_prefix(prefix, "net.0"),
+                prefix=f"{prefix}.net.0",
             ),
             nn.Identity(),  # placeholder for weight loading
             RowParallelLinear(
@@ -250,7 +290,7 @@ class FeedForward(nn.Module):
                 input_is_parallel=True,
                 return_bias=False,
                 quant_config=quant_config,
-                prefix=_join_prefix(prefix, "net.2"),
+                prefix=f"{prefix}.net.2",
             ),
         ]
 
@@ -305,7 +345,7 @@ class FluxAttention(torch.nn.Module):
             total_num_heads=self.heads,
             bias=bias,
             quant_config=quant_config,
-            prefix=_join_prefix(prefix, "to_qkv"),
+            prefix=f"{prefix}.to_qkv",
         )
 
         if not self.pre_only:
@@ -318,7 +358,7 @@ class FluxAttention(torch.nn.Module):
                         input_is_parallel=True,
                         return_bias=False,
                         quant_config=quant_config,
-                        prefix=_join_prefix(prefix, "to_out.0"),
+                        prefix=f"{prefix}.to_out.0",
                     ),
                     nn.Dropout(dropout),
                 ]
@@ -334,7 +374,7 @@ class FluxAttention(torch.nn.Module):
                 total_num_heads=self.heads,
                 bias=added_proj_bias,
                 quant_config=quant_config,
-                prefix=_join_prefix(prefix, "add_kv_proj"),
+                prefix=f"{prefix}.add_kv_proj",
             )
             self.to_add_out = RowParallelLinear(
                 self.inner_dim,
@@ -343,7 +383,7 @@ class FluxAttention(torch.nn.Module):
                 input_is_parallel=True,
                 return_bias=False,
                 quant_config=quant_config,
-                prefix=_join_prefix(prefix, "to_add_out"),
+                prefix=f"{prefix}.to_add_out",
             )
 
         self.rope = RotaryEmbedding(is_neox_style=False)
@@ -410,25 +450,12 @@ class FluxAttention(torch.nn.Module):
             and text_seq_len is not None
             and image_rotary_emb is not None
         ):
-            cos, sin = image_rotary_emb
-            if cos.dtype != query.dtype:
-                cos = cos.to(query.dtype)
-            if sin.dtype != query.dtype:
-                sin = sin.to(query.dtype)
-            txt_cos, img_cos = cos[:text_seq_len], cos[text_seq_len:]
-            txt_sin, img_sin = sin[:text_seq_len], sin[text_seq_len:]
-
+            query, key = _apply_rope_split(image_rotary_emb, query, key, text_seq_len, self.rope)
             img_query = query[:, text_seq_len:]
             img_key = key[:, text_seq_len:]
-            img_value = value[:, text_seq_len:]
             text_query = query[:, :text_seq_len]
             text_key = key[:, :text_seq_len]
             text_value = value[:, :text_seq_len]
-
-            img_query = self.rope(img_query, img_cos, img_sin)
-            img_key = self.rope(img_key, img_cos, img_sin)
-            text_query = self.rope(text_query, txt_cos, txt_sin)
-            text_key = self.rope(text_key, txt_cos, txt_sin)
 
             attn_metadata = AttentionMetadata(
                 joint_query=text_query,
@@ -443,7 +470,7 @@ class FluxAttention(torch.nn.Module):
             if encoder_hidden_states_mask is not None:
                 attn_metadata.joint_attn_mask = encoder_hidden_states_mask
 
-            hidden_states = self.attn(img_query, img_key, img_value, attn_metadata)
+            hidden_states = self.attn(img_query, img_key, value[:, text_seq_len:], attn_metadata)
         else:
             query, key = apply_rope_to_qk(self.rope, query, key, image_rotary_emb)  # [S, D/2]
 
@@ -492,11 +519,11 @@ class FluxTransformerBlock(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.norm1 = AdaLayerNormZero(dim, quant_config=quant_config, prefix=_join_prefix(prefix, "norm1"))
+        self.norm1 = AdaLayerNormZero(dim, quant_config=quant_config, prefix=f"{prefix}.norm1")
         self.norm1_context = AdaLayerNormZero(
             dim,
             quant_config=quant_config,
-            prefix=_join_prefix(prefix, "norm1_context"),
+            prefix=f"{prefix}.norm1_context",
         )
 
         self.attn = FluxAttention(
@@ -509,18 +536,18 @@ class FluxTransformerBlock(nn.Module):
             bias=True,
             eps=eps,
             quant_config=quant_config,
-            prefix=_join_prefix(prefix, "attn"),
+            prefix=f"{prefix}.attn",
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix=_join_prefix(prefix, "ff"))
+        self.ff = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix=f"{prefix}.ff")
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.ff_context = FeedForward(
             dim=dim,
             dim_out=dim,
             quant_config=quant_config,
-            prefix=_join_prefix(prefix, "ff_context"),
+            prefix=f"{prefix}.ff_context",
         )
 
     def forward(
@@ -599,7 +626,7 @@ class FluxSingleTransformerBlock(nn.Module):
         self.norm = AdaLayerNormZeroSingle(
             dim,
             quant_config=safe_quant_config(quant_config),
-            prefix=_join_prefix(prefix, "norm"),
+            prefix=f"{prefix}.norm",
         )
         if self.use_sharded_single_block:
             self.proj_mlp = ColumnParallelApproxGELU(
@@ -608,7 +635,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 approximate="tanh",
                 bias=True,
                 quant_config=quant_config,
-                prefix=_join_prefix(prefix, "proj_mlp"),
+                prefix=f"{prefix}.proj_mlp",
             )
             self.proj_out = FluxSingleBlockOutput(
                 dim,
@@ -616,7 +643,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 dim,
                 bias=True,
                 quant_config=quant_config,
-                prefix=_join_prefix(prefix, "proj_out"),
+                prefix=f"{prefix}.proj_out",
             )
         else:
             self.proj_mlp = ReplicatedLinear(
@@ -625,7 +652,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 bias=True,
                 return_bias=False,
                 quant_config=quant_config,
-                prefix=_join_prefix(prefix, "proj_mlp"),
+                prefix=f"{prefix}.proj_mlp",
             )
             self.act_mlp = nn.GELU(approximate="tanh")
             self.proj_out = ReplicatedLinear(
@@ -634,7 +661,7 @@ class FluxSingleTransformerBlock(nn.Module):
                 bias=True,
                 return_bias=False,
                 quant_config=quant_config,
-                prefix=_join_prefix(prefix, "proj_out"),
+                prefix=f"{prefix}.proj_out",
             )
 
         self.attn = FluxAttention(
@@ -647,7 +674,7 @@ class FluxSingleTransformerBlock(nn.Module):
             pre_only=True,
             output_is_parallel=self.use_sharded_single_block,
             quant_config=quant_config,
-            prefix=_join_prefix(prefix, "attn"),
+            prefix=f"{prefix}.attn",
         )
 
     def forward(
@@ -958,12 +985,7 @@ class FluxTransformer2DModel(nn.Module):
             )
             img_ids = img_ids[0]
 
-        ids = torch.cat((txt_ids, img_ids), dim=0)
-        if is_torch_npu_available():
-            freqs_cos, freqs_sin = self.pos_embed(ids.cpu())
-            image_rotary_emb = (freqs_cos.npu(), freqs_sin.npu())
-        else:
-            image_rotary_emb = self.pos_embed(ids, target_dtype=hidden_states.dtype)
+        image_rotary_emb = _compute_image_rotary_emb(self.pos_embed, txt_ids, img_ids, hidden_states.dtype)
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
@@ -1123,8 +1145,7 @@ class FluxKontextTransformer2DModel(FluxTransformer2DModel):
             )
             img_ids = img_ids[0]
 
-        ids = torch.cat((txt_ids, img_ids), dim=0)
-        image_rotary_emb = self.pos_embed(ids, target_dtype=hidden_states.dtype)
+        image_rotary_emb = _compute_image_rotary_emb(self.pos_embed, txt_ids, img_ids, hidden_states.dtype)
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
