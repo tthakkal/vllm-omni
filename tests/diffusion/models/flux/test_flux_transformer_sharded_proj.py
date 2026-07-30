@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from vllm.model_executor.layers.linear import ReplicatedLinear
+
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.models.flux.flux_transformer import (
     ColumnParallelApproxGELU,
