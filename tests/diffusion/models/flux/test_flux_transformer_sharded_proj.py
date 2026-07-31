@@ -22,7 +22,14 @@ pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 @pytest.fixture(autouse=True)
 def _init_distributed():
-    """Initialize minimal distributed state for TP-aware linear layers."""
+    """Initialize minimal distributed state for TP-aware linear layers.
+
+    ``world_size=1``: these tests cover branch selection and weight-loading
+    bookkeeping only. ``tensor_parallel_size=2`` below selects the sharded
+    branch but no collective, per-rank shard or all-reduce actually runs.
+    Real two-rank forward/load parity lives in
+    ``tests/diffusion/distributed/test_flux_sharded_proj_tp2.py``.
+    """
     from vllm.distributed.parallel_state import (
         cleanup_dist_env_and_memory,
         init_distributed_environment,
