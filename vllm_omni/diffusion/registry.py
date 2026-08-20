@@ -311,6 +311,18 @@ _DIFFUSION_MODELS = {
         "pipeline_cosmos3",
         "Cosmos3OmniDiffusersPipeline",
     ),
+    # Single-tower pipelines for the disaggregated `cosmos3_omni_disagg`
+    # topology; both subclass Cosmos3OmniDiffusersPipeline above.
+    "Cosmos3ReasonerPipeline": (
+        "cosmos3",
+        "pipeline_cosmos3_disagg",
+        "Cosmos3ReasonerPipeline",
+    ),
+    "Cosmos3GeneratorPipeline": (
+        "cosmos3",
+        "pipeline_cosmos3_disagg",
+        "Cosmos3GeneratorPipeline",
+    ),
     "SoulXSingerPipeline": (
         "soulx_singer",
         "pipeline_soulx_singer_svs",
@@ -594,6 +606,11 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "SenseNovaU1Pipeline": "get_sensenova_u1_post_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_post_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_post_process_func",
+    # The reasoner emits K/V, not pixels, so it needs its own postprocessor; the
+    # generator's output *is* an image, so it reuses the stock one (re-exported
+    # from pipeline_cosmos3_disagg, which is where both names resolve from).
+    "Cosmos3ReasonerPipeline": "get_cosmos3_reasoner_post_process_func",
+    "Cosmos3GeneratorPipeline": "get_cosmos3_post_process_func",
     "HiDreamImagePipeline": "get_hidream_image_post_process_func",
     "StableDiffusionXLPipeline": "get_sdxl_image_post_process_func",
     "Krea2Pipeline": "get_krea2_post_process_func",
@@ -606,6 +623,10 @@ _DIFFUSION_IR_OP_PRIORITY_FUNCS = {
     # where mod_folder and mod_relname are defined and mapped using `_DIFFUSION_MODELS` via the `arch` key.
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_ir_op_priority_func",
     "Cosmos3OmniPipeline": "get_cosmos3_ir_op_priority_func",
+    # The native rms_norm override is a property of the Cosmos3 kernels, not of
+    # either tower, so both disagg stages want it too.
+    "Cosmos3ReasonerPipeline": "get_cosmos3_ir_op_priority_func",
+    "Cosmos3GeneratorPipeline": "get_cosmos3_ir_op_priority_func",
 }
 
 _DIFFUSION_PRE_PROCESS_FUNCS = {
@@ -635,6 +656,8 @@ _DIFFUSION_PRE_PROCESS_FUNCS = {
     "MagiHumanPipeline": "get_magi_human_pre_process_func",
     "Cosmos3OmniDiffusersPipeline": "get_cosmos3_pre_process_func",
     "Cosmos3OmniPipeline": "get_cosmos3_pre_process_func",
+    "Cosmos3ReasonerPipeline": "get_cosmos3_pre_process_func",
+    "Cosmos3GeneratorPipeline": "get_cosmos3_pre_process_func",
     "SoulXSingerPipeline": "get_soulxsinger_pre_process_func",
     "SoulXSingerSVCPipeline": "get_soulxsinger_svc_pre_process_func",
 }

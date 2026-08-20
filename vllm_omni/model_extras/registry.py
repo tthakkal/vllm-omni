@@ -264,6 +264,12 @@ for model_class_name in ("LTX2Pipeline", "LTX2TwoStagePipeline"):
 _EXTRA_SPECS["MammothModa2ForConditionalGeneration"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
 _EXTRA_SPECS["Mammothmoda2Model"] = _EXTRA_SPECS["MammothModa2DiTPipeline"]
 
+# The disaggregated Cosmos3 topology splits the two MoT towers across stages, so
+# the OpenAI endpoint sees a per-tower class name. Both accept the same Cosmos3
+# `extra_body` params as the co-located pipeline they subclass.
+_EXTRA_SPECS["Cosmos3ReasonerPipeline"] = _EXTRA_SPECS["Cosmos3OmniDiffusersPipeline"]
+_EXTRA_SPECS["Cosmos3GeneratorPipeline"] = _EXTRA_SPECS["Cosmos3OmniDiffusersPipeline"]
+
 
 def _get_spec(model_class_name: str | None) -> dict[str, Any] | None:
     if not model_class_name:

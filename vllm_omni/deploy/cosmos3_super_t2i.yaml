@@ -1,0 +1,54 @@
+# nvidia/Cosmos3-Super-Text2Image, co-located: both Mixture-of-Transformers
+# towers in one diffusion stage.
+#
+# Cosmos3 is a two-tower MoT model (an autoregressive UND tower plus a diffusion
+# GEN tower), but this topology keeps both in a single
+# Cosmos3OmniDiffusersPipeline stage that does text encode + denoise + VAE decode
+# together, so there is no stage router and no cross-stage handoff. The GPUs are
+# used *within* the stage:
+#
+#   world size = cfg_parallel_size (2) x ulysses_degree (2) = 4
+#   hsdp_shard_size = 4  -> ~29 GiB of weights per GPU
+#
+# To scale to 8 GPUs, set ulysses_degree: 4 and hsdp_shard_size: 8 (the upstream
+# reference layout, ~23.5 GiB per GPU) and widen `devices` to "0,1,2,3,4,5,6,7".
+#
+# For one stage per tower, see cosmos3_super_t2i_disagg.yaml.
+async_chunk: false
+
+stages:
+  # `devices` are LOGICAL indexes into the process's CUDA_VISIBLE_DEVICES, not
+  # physical ids: _map_device_list treats each entry as a 0-based index into the
+  # visible list and silently drops any entry >= len(visible).
+  - stage_id: 0
+    devices: "0,1,2,3"
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.9
+    enforce_eager: true
+    # Only the non-default degrees are listed; everything omitted here
+    # (tensor/data/pipeline parallel, ring, hsdp_replicate_size) keeps its
+    # DiffusionParallelConfig default of 1.
+    parallel_config:
+      ulysses_degree: 2
+      cfg_parallel_size: 2
+      use_hsdp: true
+      hsdp_shard_size: 4
+    engine_args:
+      model_config:
+        # The setting this file exists for: guardrails default ON and the
+        # pre-process hook eager-loads the gated guardrail models at pipeline
+        # build time, hard-failing when `cosmos-guardrail` is not installed.
+        # There is no CLI flag for it. Drop this line to enable them.
+        guardrails: false
+    # A stage with no default_sampling_params gets NO per-request sampling params
+    # at all: _build_sampling_params returns None before it looks at the request
+    # overrides, so seed / num_inference_steps / guidance_scale / height / width
+    # from the request body would be silently dropped. One non-empty block is
+    # what switches per-request overrides on.
+    #
+    # Deliberately NOT pinned here: num_inference_steps, guidance_scale, height
+    # and width. Leaving them unset lets Cosmos3's own T2I defaults apply
+    # (1024x1024, 50 steps, guidance 7.0, flow_shift 3.0) while keeping the
+    # request body authoritative.
+    default_sampling_params:
+      seed: 42
