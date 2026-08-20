@@ -109,16 +109,18 @@ stages:
         guardrails: false
     # WHY BOTH STAGES CARRY default_sampling_params, AND WHY THEY MATCH
     # ----------------------------------------------------------------
-    # 1. A stage with no default_sampling_params gets NO per-request sampling
-    #    params at all: _build_sampling_params returns None before it ever
-    #    looks at the request overrides, so seed / steps / guidance_scale /
-    #    height / width from the request body would be silently dropped. One
-    #    non-empty block per stage is what switches per-request overrides on.
-    # 2. The two blocks must agree on anything that affects tokenization or
-    #    the CFG decision. The reasoner only encodes the unconditional branch
-    #    when guidance_scale > 1, and the generator re-tokenizes both prompts
-    #    to look its branches up by fingerprint; a mismatch would surface as a
-    #    replay-table miss (a loud RuntimeError, not a wrong image).
+    # 1. Only so that a run naming no seed is reproducible. Per-request
+    #    overrides do NOT depend on these blocks -- a stage without one still
+    #    gets an empty OmniDiffusionSamplingParams for the serving layer to
+    #    overlay the request on.
+    # 2. Where the two blocks pin anything the towers must agree on, they have
+    #    to agree. The reasoner only encodes the unconditional branch when
+    #    guidance_scale > 1, and the generator looks its branches up by a
+    #    fingerprint of the tokenized prompt; a per-stage disagreement there
+    #    would surface as a replay-table miss (a loud RuntimeError, not a wrong
+    #    image). seed is not one of those -- it drives the generator's noise
+    #    only -- but keeping the blocks identical avoids having to reason about
+    #    which keys are safe to diverge.
     # 3. Deliberately NOT pinned here: num_inference_steps, guidance_scale,
     #    height and width. Leaving them unset lets Cosmos3's own T2I defaults
     #    apply (1024x1024, 50 steps, guidance 7.0, flow_shift 3.0) while

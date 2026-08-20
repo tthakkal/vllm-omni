@@ -167,31 +167,50 @@ class TestColocatedDeployConfig:
         assert deploy.async_chunk is False
         assert len(deploy.stages) == 1
 
-        stage = _stage(deploy, 0)
-        assert stage.devices == "0,1,2,3"
-        parallel = stage.engine_extras["parallel_config"]
-        # world size = cfg_parallel_size x ulysses_degree = 4, matching `devices`.
-        assert parallel["cfg_parallel_size"] * parallel["ulysses_degree"] == 4
-        assert parallel["use_hsdp"] is True
-        assert parallel["hsdp_shard_size"] == 4
+    def test_parallel_degrees_agree_with_the_device_count(self):
+        """The layout must satisfy HSDP's own constraint, whatever it is scaled to.
 
-    def test_yaml_carries_the_setting_it_exists_for(self):
-        """guardrails has no CLI flag; a deploy YAML is the only way to set it."""
+        `apply_hsdp` raises unless hsdp_replicate_size x hsdp_shard_size == WORLD,
+        and WORLD here is len(devices). Asserting the invariant rather than the
+        shipped numbers means rescaling the YAML does not need a test edit, but a
+        YAML that would raise at startup still fails here, without a GPU.
+        """
+        stage = _stage(_deploy(COLOCATED_YAML), 0)
+        parallel = stage.engine_extras["parallel_config"]
+        world = len(stage.devices.split(","))
+
+        # Degrees omitted from the YAML keep their DiffusionParallelConfig default of 1.
+        degree = parallel.get("cfg_parallel_size", 1) * parallel.get("ulysses_degree", 1)
+        assert degree == world
+        assert parallel["use_hsdp"] is True
+        assert parallel.get("hsdp_replicate_size", 1) * parallel["hsdp_shard_size"] == world
+
+    def test_yaml_keeps_the_guardrail_models_out_of_the_default_path(self):
+        """Cosmos3's pre-process hook eager-loads the *gated* guardrail models at
+        pipeline build time, so leaving them on makes the shipped default
+        hard-fail wherever `cosmos-guardrail` is not installed. `serve
+        --no-guardrails` and the offline example's `--extra-body` reach the same
+        setting; this only fixes the default."""
         stage = _stage(_deploy(COLOCATED_YAML), 0)
         assert stage.engine_extras["model_config"]["guardrails"] is False
 
-    def test_yaml_enables_per_request_sampling_overrides(self):
-        """An empty default_sampling_params drops request seed/steps/size silently."""
+    def test_yaml_pins_a_seed_so_the_default_path_is_reproducible(self):
+        """Request overrides work with or without this block -- an absent one still
+        yields OmniDiffusionSamplingParams() for the stage. It exists only so a
+        run that names no seed is reproducible."""
         stage = _stage(_deploy(COLOCATED_YAML), 0)
-        assert stage.default_sampling_params
+        assert stage.default_sampling_params["seed"] == 42
 
     def test_merges_into_a_single_image_stage(self):
-        stages = merge_pipeline_deploy(COSMOS3_PIPELINE, _deploy(COLOCATED_YAML))
+        deploy = _deploy(COLOCATED_YAML)
+        stages = merge_pipeline_deploy(COSMOS3_PIPELINE, deploy)
 
         assert len(stages) == 1
         assert stages[0].model_stage == "diffusion"
         assert stages[0].final_output_type == "image"
-        assert stages[0].yaml_runtime["devices"] == "0,1,2,3"
+        # The merge must carry every YAML knob through to the stage: a dropped
+        # `devices` is what silently collapses the layout onto one GPU.
+        assert stages[0].yaml_runtime["devices"] == _stage(deploy, 0).devices
         assert stages[0].yaml_engine_args["model_config"]["guardrails"] is False
         assert stages[0].yaml_extras["default_sampling_params"]
 
@@ -229,14 +248,16 @@ class TestDisaggDeployConfig:
         } == {1}
 
     @pytest.mark.parametrize("stage_id", [0, 1])
-    def test_both_stages_disable_guardrails_and_enable_overrides(self, stage_id: int):
+    def test_both_stages_disable_guardrails(self, stage_id: int):
+        """Either stage left with guardrails on hard-fails the whole pipeline at
+        build time wherever `cosmos-guardrail` is absent."""
         stage = _stage(_deploy(DISAGG_YAML), stage_id)
 
         assert stage.engine_extras["model_config"]["guardrails"] is False
-        assert stage.default_sampling_params
 
     def test_stages_agree_on_default_sampling_params(self):
-        """Divergent tokenization-affecting defaults would surface as a replay miss."""
+        """A default that diverged per stage and affected tokenization or the CFG
+        decision would surface as a replay miss."""
         stage0, stage1 = (_stage(_deploy(DISAGG_YAML), i) for i in (0, 1))
 
         assert stage0.default_sampling_params == stage1.default_sampling_params
