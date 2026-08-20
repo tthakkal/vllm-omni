@@ -4,22 +4,33 @@
 # Cosmos3 is a two-tower MoT model (an autoregressive UND tower plus a diffusion
 # GEN tower), but this topology keeps both in a single
 # Cosmos3OmniDiffusersPipeline stage that does text encode + denoise + VAE decode
-# together, so there is no stage router and no cross-stage handoff. The GPUs are
-# used *within* the stage:
+# together, so there is no stage router, no cross-stage handoff, and -- at this
+# default -- no collectives at all: every parallel degree is 1 and HSDP is off.
 #
-#   world size = cfg_parallel_size (2) x ulysses_degree (1) = 2
-#   hsdp_shard_size = 2  -> ~61.5 GiB of weights per GPU
+# ONE CARD IS ENOUGH, AND IS THE FASTER LAYOUT
+# --------------------------------------------
+# Both towers together are 120.91 GiB of bf16 weights, which fits on one 141 GiB
+# H200 (121.56 GiB resident). Measured on one card at 20 steps, guardrails off:
 #
-# Two cards is the smallest layout that fits: both towers are ~58.1 GiB of bf16
-# weights each, so one 141 GiB card cannot hold the pair plus HSDP's per-layer
-# all-gather headroom. cfg_parallel_size 2 puts the conditional and
-# unconditional CFG branches on one GPU each.
+#   1024x1024   129.302 GB peak   253.8 ms/step
+#   1536x1536   136.798 GB peak   558.2 ms/step
+#   2048x2048   140.308 GB peak  1085.1 ms/step  <- 3.4 GiB from the card limit
 #
-# To scale up, widen `devices` and raise ulysses_degree and hsdp_shard_size
-# together so that cfg_parallel_size x ulysses_degree == hsdp_shard_size ==
-# len(devices): 4 GPUs -> ulysses_degree 2, hsdp_shard_size 4 (~31 GiB per GPU);
-# 8 GPUs -> ulysses_degree 4, hsdp_shard_size 8 (the upstream reference layout,
-# ~23.5 GiB per GPU). ulysses_degree must divide the latent sequence length.
+# Adding a second card as cfg_parallel_size 2 + hsdp_shard_size 2 makes 1024x1024
+# *slower* (439.4 ms/step), because HSDP all-gathers each layer's shard from the
+# peer every step and that costs more than splitting the two CFG branches saves.
+# So scale out for headroom, not for speed:
+#
+#   guardrails on, max_num_seqs > 1, or resolutions past 2048x2048 will not fit
+#   on one card. Then widen `devices` and keep
+#   cfg_parallel_size x ulysses_degree == hsdp_shard_size == len(devices):
+#     2 GPUs -> cfg_parallel_size 2, use_hsdp true, hsdp_shard_size 2  (62.37 GiB
+#               resident per GPU, 70.436 GB peak at 1024x1024)
+#     4 GPUs -> also ulysses_degree 2, hsdp_shard_size 4  (~31 GiB per GPU)
+#     8 GPUs -> also ulysses_degree 4, hsdp_shard_size 8  (the upstream reference
+#               layout, ~23.5 GiB per GPU)
+#   ulysses_degree must divide the latent sequence length (1024x1024 gives a GEN
+#   sequence of 32*32 = 1024 tokens).
 #
 # For one stage per tower, see cosmos3_super_t2i_disagg.yaml.
 async_chunk: false
@@ -29,17 +40,17 @@ stages:
   # physical ids: _map_device_list treats each entry as a 0-based index into the
   # visible list and silently drops any entry >= len(visible).
   - stage_id: 0
-    devices: "0,1"
+    devices: "0"
     max_num_seqs: 1
     gpu_memory_utilization: 0.9
     enforce_eager: true
-    # Only the non-default degrees are listed; everything omitted here
-    # (tensor/data/pipeline parallel, ulysses, ring, hsdp_replicate_size) keeps
-    # its DiffusionParallelConfig default of 1.
+    # Everything omitted here (tensor/data/pipeline parallel, ulysses, ring, cfg,
+    # hsdp_replicate_size) keeps its DiffusionParallelConfig default of 1, so
+    # use_hsdp: false is the only line this block needs -- it is already the
+    # default, and is stated to make the single-card layout explicit rather than
+    # inherited.
     parallel_config:
-      cfg_parallel_size: 2
-      use_hsdp: true
-      hsdp_shard_size: 2
+      use_hsdp: false
     engine_args:
       model_config:
         # guardrails default ON, and the pre-process hook eager-loads the *gated*

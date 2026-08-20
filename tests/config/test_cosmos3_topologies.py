@@ -168,22 +168,37 @@ class TestColocatedDeployConfig:
         assert len(deploy.stages) == 1
 
     def test_parallel_degrees_agree_with_the_device_count(self):
-        """The layout must satisfy HSDP's own constraint, whatever it is scaled to.
+        """The layout must satisfy the constraints its own degrees imply, whatever
+        it is scaled to.
 
-        `apply_hsdp` raises unless hsdp_replicate_size x hsdp_shard_size == WORLD,
-        and WORLD here is len(devices). Asserting the invariant rather than the
-        shipped numbers means rescaling the YAML does not need a test edit, but a
-        YAML that would raise at startup still fails here, without a GPU.
+        The product of the parallel degrees has to equal WORLD (= len(devices)),
+        and `apply_hsdp` additionally raises unless hsdp_replicate_size x
+        hsdp_shard_size == WORLD. Asserting the invariants rather than the shipped
+        numbers means rescaling the YAML needs no test edit, but a YAML that would
+        raise at startup still fails here, without a GPU.
         """
         stage = _stage(_deploy(COLOCATED_YAML), 0)
         parallel = stage.engine_extras["parallel_config"]
         world = len(stage.devices.split(","))
 
         # Degrees omitted from the YAML keep their DiffusionParallelConfig default of 1.
-        degree = parallel.get("cfg_parallel_size", 1) * parallel.get("ulysses_degree", 1)
+        degree = 1
+        for key in ("cfg_parallel_size", "ulysses_degree", "ring_degree", "tensor_parallel_size"):
+            degree *= parallel.get(key, 1)
         assert degree == world
-        assert parallel["use_hsdp"] is True
-        assert parallel.get("hsdp_replicate_size", 1) * parallel["hsdp_shard_size"] == world
+
+        if parallel.get("use_hsdp", False):
+            assert parallel.get("hsdp_replicate_size", 1) * parallel["hsdp_shard_size"] == world
+
+    def test_default_needs_no_collectives(self):
+        """One card holds all 120.91 GiB of both towers, and HSDP on two cards is
+        *slower* at 1024x1024 (439.4 vs 253.8 ms/step) because it all-gathers every
+        layer from the peer each step. So the default ships without collectives;
+        scaling out is for headroom (guardrails on, batching, >2048x2048)."""
+        stage = _stage(_deploy(COLOCATED_YAML), 0)
+
+        assert stage.devices == "0"
+        assert stage.engine_extras["parallel_config"]["use_hsdp"] is False
 
     def test_yaml_keeps_the_guardrail_models_out_of_the_default_path(self):
         """Cosmos3's pre-process hook eager-loads the *gated* guardrail models at
