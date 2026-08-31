@@ -561,7 +561,6 @@ class FluxSingleTransformerBlock(nn.Module):
         parallel_config: DiffusionParallelConfig | None = None,
     ):
         super().__init__()
-        self.parallel_config = parallel_config
         self.mlp_hidden_dim = int(dim * mlp_ratio)
         self.use_sharded_single_block = _use_sharded_single_block_path(parallel_config)
 
@@ -734,7 +733,7 @@ class FluxTransformer2DModel(nn.Module):
     # the small and frequently-repeated block(s) of a model
     # -- typically a transformer layer
     # used for torch compile optimizations
-    _repeated_blocks = ["FluxTransformerBlock", "FluxSingleTransformerBlock"]
+    _repeated_blocks = ["FluxTransformerBlock"]
     _layerwise_offload_blocks_attrs = ["transformer_blocks", "single_transformer_blocks"]
     # No _sp_plan: FLUX computes image_rotary_emb via a free function over concatenated
     # txt+img ids, so there is no module to hook for sharding the RoPE freqs (unlike
@@ -965,14 +964,21 @@ class FluxTransformer2DModel(nn.Module):
                     and ".proj_mlp." in lookup_name
                 ):
                     lookup_name = lookup_name.replace(".proj_mlp.", ".proj_mlp.proj.")
-                elif "single_transformer_blocks." in lookup_name and ".proj_out." in lookup_name:
-                    module_name, _, weight_name = lookup_name.rpartition(".proj_out.")
+                elif (
+                    lookup_name not in params_dict
+                    and "single_transformer_blocks." in lookup_name
+                    and ".proj_out." in lookup_name
+                ):
+                    # Sharded path only: proj_out is a FluxSingleBlockOutput whose
+                    # parameters live on the attn/mlp halves, so the checkpoint name has
+                    # no matching entry in params_dict.
+                    module_name, _, proj_out_param = lookup_name.rpartition(".proj_out.")
                     proj_out_module = self.get_submodule(f"{module_name}.proj_out")
-                    if hasattr(proj_out_module, "load_weight") and hasattr(proj_out_module, "loaded_parameter_names"):
-                        proj_out_module.load_weight(weight_name, loaded_weight)
+                    if isinstance(proj_out_module, FluxSingleBlockOutput):
+                        proj_out_module.load_weight(proj_out_param, loaded_weight)
                         loaded_params.add(original_name)
                         loaded_params.add(lookup_name)
-                        for suffix in proj_out_module.loaded_parameter_names(weight_name):
+                        for suffix in proj_out_module.loaded_parameter_names(proj_out_param):
                             loaded_params.add(f"{module_name}.proj_out.{suffix}")
                         continue
 

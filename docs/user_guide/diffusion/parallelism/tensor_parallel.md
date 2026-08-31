@@ -93,9 +93,9 @@ vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8091 \
 
 In `DiffusionParallelConfig`:
 
-| Parameter              | Type | Default | Description                                                                |
-| ---------------------- | ---- | ------- | -------------------------------------------------------------------------- |
-| `tensor_parallel_size` | int  | 1       | Number of GPUs to shard model weights across. Must divide number of heads. |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `tensor_parallel_size` | int | 1 | Number of GPUs to shard model weights across. Must divide number of heads. |
 
 ---
 
@@ -103,11 +103,11 @@ In `DiffusionParallelConfig`:
 
 ### FLUX.1: sharded single-stream projections
 
-FLUX.1 has 38 single-stream blocks (`FluxSingleTransformerBlock`). By default their
-`proj_mlp` and `proj_out` layers are **replicated** on every TP rank: each rank all-gathers
-the attention output and runs the full projection GEMMs. Setting
-`VLLM_OMNI_FLUX1_SHARDED_PROJ` shards those two layers instead, so each rank holds only
-its slice and the pair costs a single all-reduce:
+FLUX.1's 38 single-stream blocks (`FluxSingleTransformerBlock`) **replicate** their
+`proj_mlp`/`proj_out` layers on every TP rank: each rank all-gathers the attention output
+and runs the full projection GEMMs. Set `VLLM_OMNI_FLUX1_SHARDED_PROJ` before starting
+the engine to shard those two layers instead, so each rank holds one slice and the pair
+costs a single all-reduce:
 
 ```bash
 VLLM_OMNI_FLUX1_SHARDED_PROJ=1 \
@@ -115,32 +115,19 @@ VLLM_OMNI_FLUX1_SHARDED_PROJ=1 \
     --tensor-parallel-size 2
 ```
 
-| Value | Effect |
-| ------- | -------- |
-| unset (default) | Replicated `proj_mlp`/`proj_out`. |
-| `1`, `true`, `yes`, `on` | Sharded `proj_mlp`/`proj_out` when `tensor_parallel_size > 1`. |
-| anything else | Replicated (same as unset). |
+Enabling values are `1`, `true`, `yes` and `on`; anything else — including unset and
+`tensor_parallel_size=1` — keeps the replicated path. On FLUX.1-dev at
+`tensor_parallel_size=2` (28 steps, 1024x1024, BF16) this cut denoise step latency ~10%
+and peak memory ~12%; the gain varies with resolution, step count, and TP degree.
 
-Notes:
-
-- The flag is read when the block is constructed, so it must be set before the engine
-  starts. It has no effect at `tensor_parallel_size=1`.
-- Because the reduction order changes, output is **not bit-identical** to the replicated
-  path. The composition is unchanged and the drift is confined to high-frequency detail,
-  but do not expect byte-equal images across the flag. Each setting is reproducible on
-  its own for a fixed seed.
-- Measured on FLUX.1-dev, `tensor_parallel_size=2`, 28 steps, 1024x1024, BF16 (mean of 3
-  runs): denoise step latency 1123 ms -> 1005 ms (-10.5%) and peak memory 26.8 GB ->
-  23.7 GB (-11.6%). The gain scales with how much of the step the single-stream blocks
-  occupy, so it varies by resolution, step count, and TP degree.
-- It is opt-in because the sharded path uses its own checkpoint split loader, which has
-  been validated on unquantized checkpoints and on per-tensor/per-channel FP8 scales.
-  Layouts it knows it cannot split — a parameter missing on the split projections, or
-  GPTQ/AWQ act-order group indices — raise an error naming this variable, and the
-  replicated path remains the fallback. Other quantization layouts are untested; verify
-  output quality before enabling the flag on one.
-- The double-stream blocks (`FluxTransformerBlock`) are always TP-sharded and are not
-  affected by this flag.
+It is opt-in because the sharded path uses its own checkpoint split loader, validated on
+unquantized checkpoints and on per-tensor/per-channel FP8 scales. Layouts it cannot split
+(a parameter missing on the split projections, or GPTQ/AWQ act-order group indices) raise
+an error naming this variable; other quantization layouts are untested, so verify output
+quality before enabling it on one. Output is **not bit-identical** to the replicated path
+because the reduction order differs, though each setting is reproducible on its own for a
+fixed seed. The double-stream blocks (`FluxTransformerBlock`) are always TP-sharded and
+are unaffected.
 
 ---
 
