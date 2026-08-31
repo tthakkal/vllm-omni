@@ -67,6 +67,7 @@ from vllm_omni.engine.messages import (
     EngineQueueMessage,
     ErrorMessage,
     InteractionMessage,
+    OutputMessage,
     StageSubmissionMessage,
 )
 from vllm_omni.engine.orchestrator import Orchestrator
@@ -253,6 +254,7 @@ class AsyncOmniEngine:
         self._correlated_rpc_client: CorrelatedRpcClient | None = None
         self._duplex_control_client: DuplexControlClient | None = None
         self._running_counter = OmniRequestCounter()
+        self._engines_waiting_counter = OmniRequestCounter()
 
         logger.info(f"[AsyncOmniEngine] Launching Orchestrator thread with {self.num_stages} stages")
 
@@ -417,6 +419,7 @@ class AsyncOmniEngine:
                 pd_config=pd_config,
                 membership_controller=membership_controller,
                 running_counter=self._running_counter,
+                engines_waiting_counter=self._engines_waiting_counter,
                 transfer_emitter=self._transfer_emitter,
                 prom_metrics=self._prom_metrics,
                 log_stats=self._log_stats,
@@ -1048,6 +1051,7 @@ class AsyncOmniEngine:
             ring_degree = normalized_kwargs.get("ring_degree") or 1
             allgather_degree = normalized_kwargs.get("allgather_degree") or 1
             ulysses_mode = normalized_kwargs.get("ulysses_mode") or "strict"
+            ulysses_a2a_permute = bool(normalized_kwargs.get("ulysses_a2a_permute", False))
             sequence_parallel_size = normalized_kwargs.get("sequence_parallel_size")
             pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
             data_parallel_size = normalized_kwargs.get("data_parallel_size")
@@ -1074,6 +1078,7 @@ class AsyncOmniEngine:
                 ring_degree=ring_degree,
                 allgather_degree=allgather_degree,
                 ulysses_mode=ulysses_mode,
+                ulysses_a2a_permute=ulysses_a2a_permute,
                 cfg_parallel_size=cfg_parallel_size,
                 vae_patch_parallel_size=vae_patch_parallel_size,
                 vae_parallel_mode=vae_parallel_mode,
@@ -1918,12 +1923,16 @@ class AsyncOmniEngine:
         self,
         request_ids: list[str],
         timeout: float | None = None,
-    ) -> None:
+    ) -> list[OutputMessage]:
         """Abort requests and wait for orchestrator acknowledgment.
 
         Unlike :meth:`abort`, this generates an ``rpc_id``, correlates the
         :class:`AbortResultMessage` via :class:`CorrelatedRpcClient`, and
         raises if the orchestrator reports failure or times out.
+
+        Returns:
+            Final-stage AR abort ``OutputMessage`` list carrying partial
+            tokens generated before abort (empty for diffusion / no OP state).
         """
         if not request_ids or getattr(self, "_shutdown_called", False):
             return
@@ -1957,6 +1966,7 @@ class AsyncOmniEngine:
             raise
         if not result_msg.success:
             raise RuntimeError(result_msg.error or "abort failed")
+        return list(result_msg.abort_outputs or [])
 
     def submit_interaction(
         self,
