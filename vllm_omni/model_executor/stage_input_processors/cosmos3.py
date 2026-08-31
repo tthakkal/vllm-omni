@@ -7,8 +7,9 @@ into stage 1's prompt. GLM-Image passes ``prior_token_ids``; Cosmos3 passes the
 UND tower's per-layer K/V, which travels in ``extra`` and is installed on the
 generator's replay stub.
 
-The signature follows the ``source_outputs`` convention the orchestrator
-dispatches on (see ``_accepts_source_outputs_processor``).
+The signature follows the ``(source_outputs, prompt, requires_multimodal_data)``
+convention the orchestrator dispatches on for a ``diffusion`` next stage, the same
+one ``glm_image.ar2diffusion`` uses.
 
 The payload keys are imported from ``diffusion.models.cosmos3_pipeline_config``,
 not from the tower pipelines: this module runs in the orchestrator process, which
@@ -22,10 +23,17 @@ Generation knobs -- seed, ``num_inference_steps``, ``guidance_scale``,
 re-copying them into the prompt dict would create a second, competing source of
 truth.
 
-What *is* echoed is only what the generator cannot re-derive: the geometry and
-tokenization settings the reasoner actually used. The generator re-runs the same
-tokenizer to compute the K/V fingerprint, so any divergence there turns into a
-replay-table miss rather than a silently wrong image.
+The reasoner's geometry and tokenization settings are not forwarded either, for
+the same reason: the generator resolves them from those same sampling params,
+through the very helpers the reasoner used (``_resolve_t2i_geometry`` /
+``_resolve_text_encode_params``), so a prompt-dict copy would be a second source
+of truth for values the generator does not read from the prompt dict anyway. They
+travel in ``META_KEY`` instead, purely as diagnostics -- the generator compares
+the reasoner's declared K/V layout against its own and reports a stage-config
+mismatch in those terms rather than as a bare shape error.
+
+So what this forwards is exactly three things: the prompt text, the
+``modalities`` marker the generator's own T2I check keys off, and the K/V.
 """
 
 from __future__ import annotations
@@ -71,8 +79,9 @@ def _find_und_payload(source_outputs: list[Any]) -> dict[str, Any] | None:
     Both the ``RequestOutput`` and the inner ``CompletionOutput`` are probed
     because ``multimodal_output`` is a dynamic attribute on both: the connector
     serde restores it wherever it was set (``_decode_request_output`` /
-    ``_decode_completion_output`` in ``omni_connectors/utils/serialization.py``),
-    so which holder carries it depends on the transport.
+    ``_decode_completion_output`` in
+    ``vllm_omni/distributed/omni_connectors/utils/serialization.py``), so which
+    holder carries it depends on the transport.
     """
     for output in source_outputs:
         for holder in (output, *(getattr(output, "outputs", None) or [])):
@@ -112,17 +121,11 @@ def reasoner2generator(
         # The generator stage re-runs _is_t2i_request, which keys purely off this
         # list, so it has to be restated here.
         "modalities": ["image"],
-        "height": meta.get("height") or original.get("height"),
-        "width": meta.get("width") or original.get("width"),
         "extra": {
             KV_KEY: payload[KV_KEY],
             META_KEY: meta,
         },
     }
-    if meta.get("use_system_prompt") is not None:
-        generator_input["use_system_prompt"] = meta["use_system_prompt"]
-    if meta.get("max_sequence_length") is not None:
-        generator_input["max_sequence_length"] = meta["max_sequence_length"]
 
     # The negative prompt must match too: with guidance active the reasoner
     # encoded an unconditional branch from it, and the generator re-tokenizes
@@ -134,7 +137,7 @@ def reasoner2generator(
         "[reasoner2generator] forwarding %d K/V branch(es) (%s MiB) target=%sx%s",
         len(payload[KV_KEY]),
         meta.get("payload_mib", "?"),
-        generator_input["height"],
-        generator_input["width"],
+        meta.get("height", "?"),
+        meta.get("width", "?"),
     )
     return generator_input

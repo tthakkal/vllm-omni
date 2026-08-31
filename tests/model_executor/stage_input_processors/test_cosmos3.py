@@ -40,6 +40,10 @@ def _meta(**overrides: Any) -> dict[str, Any]:
         "use_system_prompt": False,
         "num_branches": 1,
         "payload_mib": 12.5,
+        "num_layers": 2,
+        "num_kv_heads_local": 8,
+        "head_dim": 128,
+        "tp_size": 1,
     }
     meta.update(overrides)
     return meta
@@ -133,41 +137,40 @@ class TestReasoner2Generator:
         assert result["modalities"] == ["image"]
         assert result["extra"][KV_KEY] is table
         assert result["extra"][META_KEY]["payload_mib"] == 12.5  # meta passes through intact
-        assert result["height"] == 1024
-        assert result["width"] == 1024
 
-    def test_reasoner_geometry_wins_over_the_original_prompt(self):
-        """The generator must reproduce the geometry the reasoner tokenized with."""
-        output = _reasoner_output(meta=_meta(height=512, width=768))
+    def test_forwards_exactly_prompt_modalities_and_kv(self):
+        """The bridge's whole job, stated as a closed set.
+
+        Anything else it added would be a second source of truth for a value the
+        generator resolves from its own sampling params.
+        """
+        result = reasoner2generator([_reasoner_output()], prompt={"prompt": "a red car"})
+
+        assert set(result) == {"prompt", "modalities", "extra"}
+        assert set(result["extra"]) == {KV_KEY, META_KEY}
+
+    def test_does_not_forward_geometry_or_tokenization_settings(self):
+        """Both stages resolve these from the same sampling params, through the same
+        ``_resolve_t2i_geometry`` / ``_resolve_text_encode_params`` helpers, and the
+        generator does not read them from its prompt dict at all. They ride in
+        ``META_KEY`` purely as diagnostics."""
+        output = _reasoner_output(meta=_meta(height=512, width=768, use_system_prompt=True, max_sequence_length=256))
 
         result = reasoner2generator([output], prompt={"prompt": "x", "height": 1024, "width": 1024})
 
-        assert (result["height"], result["width"]) == (512, 768)
+        assert not {"height", "width", "use_system_prompt", "max_sequence_length"} & set(result)
+        assert result["extra"][META_KEY]["height"] == 512
+        assert result["extra"][META_KEY]["max_sequence_length"] == 256
 
-    def test_falls_back_to_prompt_geometry(self):
-        output = _reasoner_output(meta=_meta(height=None, width=None))
+    def test_forwards_the_kv_layout_for_the_generators_consistency_check(self):
+        """The generator compares these against its own config to report a
+        stage-configuration mismatch in those terms rather than as a bare shape
+        error from inside cross-attention."""
+        output = _reasoner_output(meta=_meta(num_layers=64, num_kv_heads_local=4, head_dim=128, tp_size=2))
 
-        result = reasoner2generator([output], prompt={"prompt": "x", "height": 720, "width": 1280})
+        meta = reasoner2generator([output], prompt={"prompt": "x"})["extra"][META_KEY]
 
-        assert (result["height"], result["width"]) == (720, 1280)
-
-    def test_forwards_tokenization_settings(self):
-        output = _reasoner_output(meta=_meta(use_system_prompt=True, max_sequence_length=256))
-
-        result = reasoner2generator([output], prompt={"prompt": "x"})
-
-        assert result["use_system_prompt"] is True
-        assert result["max_sequence_length"] == 256
-
-    def test_omits_tokenization_settings_the_reasoner_did_not_report(self):
-        meta = _meta()
-        del meta["use_system_prompt"]
-        del meta["max_sequence_length"]
-
-        result = reasoner2generator([_reasoner_output(meta=meta)], prompt={"prompt": "x"})
-
-        assert "use_system_prompt" not in result
-        assert "max_sequence_length" not in result
+        assert (meta["num_layers"], meta["num_kv_heads_local"], meta["head_dim"], meta["tp_size"]) == (64, 4, 128, 2)
 
     def test_forwards_negative_prompt(self):
         """With guidance active the reasoner encoded an unconditional branch from

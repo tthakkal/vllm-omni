@@ -57,8 +57,19 @@ With ``quant_config is None`` that last check raises for any expected parameter
 that no checkpoint tensor filled. Dropping a tower from inside ``load_weights``
 is therefore too late -- the snapshot already contains the dropped tower's
 parameters and every one of them shows up as unloaded. Dropping in ``__init__``
-means those parameters never exist, so they are never snapshotted, never
-allocated, and their checkpoint shards are skipped while streaming.
+means those parameters never exist, so they are never snapshotted and never
+allocated. That is where the win is: ~58 GiB of device memory per stage.
+
+WHAT THE SPLIT DOES *NOT* SAVE: CHECKPOINT READS
+-----------------------------------------------
+Both stages still stream the whole checkpoint. ``Cosmos3.load_weights`` filters
+by name *after* ``safetensors_weights_iterator`` has already materialized each
+tensor, so the dropped tower's tensors are read from disk and discarded rather
+than skipped (the "kept N/M tensors" line it logs is the filter, not the read).
+Splitting the towers therefore roughly doubles aggregate startup read I/O across
+the two stages instead of halving it. Fixing that means teaching the loader to
+skip tensors by name before materializing them, which is a loader change and not
+in scope here.
 """
 
 from __future__ import annotations
@@ -67,6 +78,8 @@ import hashlib
 from typing import Any, ClassVar
 
 import torch
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed.parallel_state import model_parallel_is_initialized
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.models.cosmos3_pipeline_config import (
@@ -75,14 +88,12 @@ from vllm_omni.diffusion.models.cosmos3_pipeline_config import (
 from vllm_omni.diffusion.models.cosmos3_pipeline_config import (
     COSMOS3_UND_META_KEY as META_KEY,
 )
+from vllm_omni.diffusion.models.cosmos3_pipeline_config import (
+    COSMOS3_UND_PAYLOAD_WARN_MIB,
+)
 
 from .pipeline_cosmos3 import (
-    COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH,
-    COSMOS3_EDGE_T2I_DEFAULT_HEIGHT,
-    COSMOS3_EDGE_T2I_DEFAULT_WIDTH,
     COSMOS3_T2I_DEFAULT_GUIDANCE_SCALE,
-    COSMOS3_T2I_DEFAULT_HEIGHT,
-    COSMOS3_T2I_DEFAULT_WIDTH,
     Cosmos3OmniDiffusersPipeline,
 )
 
@@ -114,6 +125,18 @@ def fingerprint_text_ids(text_ids: torch.Tensor) -> str:
     """
     flat = text_ids.detach().to(device="cpu", dtype=torch.int64).reshape(-1).numpy()
     return hashlib.sha256(flat.tobytes()).hexdigest()[:32]
+
+
+def _tp_world_size() -> int:
+    """This process's TP world size, or 1 when no model-parallel group exists.
+
+    Reported in the handoff metadata so a stage-configuration mismatch can name
+    both stages' TP sizes. Purely diagnostic -- the K/V layout that actually gets
+    validated is read off the tensors and off the consuming attention module, not
+    recomputed from this. A process with no TP group is at TP 1 by definition,
+    which is also what makes this callable from a single-process test.
+    """
+    return get_tensor_model_parallel_world_size() if model_parallel_is_initialized() else 1
 
 
 def _drop_blocks(module_list: torch.nn.ModuleList, label: str) -> None:
@@ -159,17 +182,84 @@ class _ReplayLanguageModel(torch.nn.Module):
 
     _layerwise_offload_blocks_attrs: ClassVar[list[str]] = ["layers"]
 
-    def __init__(self, num_hidden_layers: int, rotary_emb: torch.nn.Module) -> None:
+    def __init__(
+        self,
+        num_hidden_layers: int,
+        rotary_emb: torch.nn.Module,
+        *,
+        num_kv_heads_local: int,
+        head_dim: int,
+    ) -> None:
         super().__init__()
         self.num_hidden_layers = num_hidden_layers
         self.rotary_emb = rotary_emb
         self.layers = torch.nn.ModuleList()
+        # The per-layer K/V shape this stage's own cross-attention will consume,
+        # derived from this stage's config and TP world size -- see ``install``.
+        self.num_kv_heads_local = num_kv_heads_local
+        self.head_dim = head_dim
         self._table: dict[str, Any] = {}
         self._dtype: torch.dtype | None = None
 
     def install(self, table: dict[str, Any], dtype: torch.dtype | None = None) -> None:
+        """Validate a reasoner payload against this stage's layout, then hold it.
+
+        WHY THE SHAPES ARE CHECKED HERE AND NOT IN ``forward``
+        -----------------------------------------------------
+        UND K/V is TP-sharded: ``Cosmos3SelfAttention`` produces
+        ``[B, S_und, num_kv_heads // tp_size, head_dim]`` and
+        ``Cosmos3CrossAttention`` consumes exactly that. The reasoner stage runs
+        with its *own* ``tensor_parallel_size``, and nothing in the stage
+        plumbing requires the two stages to agree on it -- so a payload built at
+        TP 1 and replayed on a TP 2 generator carries twice the KV heads this
+        stage expects. Left unchecked that surfaces either as a shape error deep
+        inside attention or, worse, as silently wrong conditioning.
+
+        Validating at install time costs ``2 * num_hidden_layers`` shape reads
+        once per request, rather than once per denoising step, and reports the
+        mismatch in terms of the two stages' configurations.
+        """
+        for key, entry in table.items():
+            if len(entry) != self.num_hidden_layers:
+                raise RuntimeError(
+                    f"Cosmos3 reasoner K/V for branch {key} has {len(entry)} layer(s), "
+                    f"generator expects {self.num_hidden_layers}. The two stages must load "
+                    "the same checkpoint and the same transformer config."
+                )
+            for layer_idx, (k, v) in enumerate(entry):
+                for label, tensor in (("K", k), ("V", v)):
+                    if tensor.ndim != 4:
+                        raise RuntimeError(
+                            f"Cosmos3 reasoner {label} for branch {key} layer {layer_idx} has "
+                            f"{tensor.ndim} dim(s), expected 4 ([B, S_und, num_kv_heads_local, head_dim])."
+                        )
+                    if tensor.shape[-2:] != (self.num_kv_heads_local, self.head_dim):
+                        raise RuntimeError(
+                            f"Cosmos3 reasoner {label} for branch {key} layer {layer_idx} is shaped "
+                            f"{tuple(tensor.shape)}, but this generator stage consumes "
+                            f"[B, S_und, {self.num_kv_heads_local}, {self.head_dim}]. UND K/V is "
+                            "TP-sharded, so the reasoner and generator stages must run with the "
+                            "same tensor_parallel_size and the same transformer config."
+                        )
+                if k.shape != v.shape:
+                    raise RuntimeError(
+                        f"Cosmos3 reasoner K/V for branch {key} layer {layer_idx} disagree on shape: "
+                        f"K={tuple(k.shape)}, V={tuple(v.shape)}."
+                    )
         self._table = table
         self._dtype = dtype
+
+    def clear(self) -> None:
+        """Drop the installed payload.
+
+        The stub is long-lived pipeline state while a payload belongs to exactly
+        one request, so the generator clears it once the request is done. That
+        keeps a stale branch from ever being replayable for a later request and
+        releases the pinned host tensors instead of holding the last request's
+        K/V until the next one arrives.
+        """
+        self._table = {}
+        self._dtype = None
 
     def forward(
         self,
@@ -184,12 +274,8 @@ class _ReplayLanguageModel(torch.nn.Module):
                 "Cosmos3 generator stage has no reasoner K/V for this prompt "
                 f"branch (fingerprint={key}, known={sorted(self._table)}). The "
                 "reasoner and generator stages must tokenize identically: check "
-                "that height/width/max_sequence_length/use_system_prompt and the "
-                "negative prompt are forwarded unchanged across the stage bridge."
-            )
-        if len(entry) != self.num_hidden_layers:
-            raise RuntimeError(
-                f"Cosmos3 reasoner K/V has {len(entry)} layers, generator expects {self.num_hidden_layers}."
+                "that max_sequence_length/use_system_prompt, the geometry and the "
+                "negative prompt reach both stages unchanged in sampling_params."
             )
         device = text_ids.device
         dtype = self._dtype
@@ -215,7 +301,9 @@ class _Cosmos3TowerPipeline(Cosmos3OmniDiffusersPipeline):
     ``language_model.layers.*`` vs ``gen_layers.*``. Keys belonging to the
     dropped tower therefore match no live parameter and are filtered out by the
     inherited ``load_weights`` -- which is what lets each stage load half a model
-    without a separately prepared checkpoint.
+    without a separately prepared checkpoint. The filter runs after the tensor
+    has been read, so this saves device memory, not startup I/O; see the module
+    docstring.
     """
 
     def __init__(self, *, od_config: Any, prefix: str = "") -> None:
@@ -289,20 +377,15 @@ class Cosmos3ReasonerPipeline(_Cosmos3TowerPipeline):
         grad context for the configuration, and deliberately selects plain
         ``no_grad`` when HSDP or distributed layerwise offload is on.
         """
-        # sp.height/sp.width, not _get_sp_param: the stock T2I branch reads the
-        # attributes directly, and the image-generation path always fills them in
-        # from the request size.
-        height = int(
-            sp.height or (COSMOS3_EDGE_T2I_DEFAULT_HEIGHT if self.is_edge_model else COSMOS3_T2I_DEFAULT_HEIGHT)
+        # Resolved through the *same* helpers the stock T2I ``forward`` uses, so
+        # the two paths cannot drift apart and make the fingerprints disagree.
+        # ``default_use_system_prompt=False`` is what the stock path resolves to
+        # here, because its ``is_v2v`` is always False for T2I.
+        height, width = self._resolve_t2i_geometry(sp)
+        max_sequence_length, use_system_prompt, frame_rate = self._resolve_text_encode_params(
+            sp,
+            default_use_system_prompt=False,
         )
-        width = int(sp.width or (COSMOS3_EDGE_T2I_DEFAULT_WIDTH if self.is_edge_model else COSMOS3_T2I_DEFAULT_WIDTH))
-        max_sequence_length = int(
-            self._get_sp_param(sp, "max_sequence_length", COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH)
-            or COSMOS3_DEFAULT_MAX_SEQUENCE_LENGTH
-        )
-        # Same default the stock T2I path uses (its ``is_v2v`` is False here).
-        use_system_prompt = bool(self._get_sp_param(sp, "use_system_prompt", False))
-        frame_rate = self._get_sp_param(sp, "resolved_frame_rate") or self._get_sp_param(sp, "frame_rate") or 24.0
         guidance_scale = self._resolve_guidance_scale(sp, COSMOS3_T2I_DEFAULT_GUIDANCE_SCALE)
 
         # Inherited formatter/tokenizer: the generator stage runs the identical
@@ -385,6 +468,10 @@ class Cosmos3ReasonerPipeline(_Cosmos3TowerPipeline):
             sum(k.numel() * k.element_size() + v.numel() * v.element_size() for kv in table.values() for k, v in kv)
             / 2**20
         )
+        # Every branch has the same layout -- same tower, same config -- so one
+        # tensor describes all of them.
+        sample_branch = next(iter(table.values()))
+        sample_k = sample_branch[0][0]
         logger.info(
             "Cosmos3 reasoner: %d branch(es) (cfg=%s), K/V payload=%.1f MiB, target=%dx%d",
             len(table),
@@ -393,6 +480,20 @@ class Cosmos3ReasonerPipeline(_Cosmos3TowerPipeline):
             height,
             width,
         )
+        if payload_mib > COSMOS3_UND_PAYLOAD_WARN_MIB:
+            # Not an error: an oversized payload is still correct, just expensive
+            # to serialize and ship. Almost always a symptom of a
+            # ``max_sequence_length`` far larger than the prompt needs, since the
+            # payload is trimmed to the real text length.
+            logger.warning(
+                "Cosmos3 reasoner: K/V payload is %.1f MiB (> %.1f MiB) for a %d-token "
+                "conditioning length; every byte crosses the stage edge once per request. "
+                "Consider lowering max_sequence_length (currently %d).",
+                payload_mib,
+                COSMOS3_UND_PAYLOAD_WARN_MIB,
+                max(k.shape[1] for kv in table.values() for k, _v in kv),
+                max_sequence_length,
+            )
         return {
             KV_KEY: table,
             META_KEY: {
@@ -402,6 +503,17 @@ class Cosmos3ReasonerPipeline(_Cosmos3TowerPipeline):
                 "use_system_prompt": use_system_prompt,
                 "num_branches": len(table),
                 "payload_mib": round(payload_mib, 1),
+                # K/V layout, so the generator can report a stage-configuration
+                # mismatch in terms of the two stages' settings instead of a bare
+                # shape error from inside attention. Read off the tensors that were
+                # actually produced rather than recomputed from the config, so it
+                # cannot describe a payload this stage did not emit. UND K/V is
+                # TP-sharded, so ``tp_size`` belongs here too -- it is the one part
+                # of the layout no shape reveals.
+                "num_layers": len(sample_branch),
+                "num_kv_heads_local": int(sample_k.shape[-2]),
+                "head_dim": int(sample_k.shape[-1]),
+                "tp_size": _tp_world_size(),
             },
         }
 
@@ -421,21 +533,55 @@ class Cosmos3GeneratorPipeline(_Cosmos3TowerPipeline):
     dummy_run_num_frames: ClassVar[int] = 0
 
     def _drop_unused_tower(self) -> None:
-        language_model = self.transformer.language_model
+        transformer = self.transformer
+        language_model = transformer.language_model
         _drop_blocks(language_model.layers, "UND (reasoner)")
         # Swap the (now block-less) tower for the replay stub, carrying the real
         # rotary embedding across -- see _ReplayLanguageModel's docstring. Both
         # towers are built from ``transformer.num_hidden_layers``, so that is also
         # the per-layer K/V count the reasoner will ship.
+        #
+        # The expected K/V shape is read from the module that will actually receive
+        # the replayed tensors, rather than recomputed from the config and the TP
+        # world size. Cosmos3CrossAttention already resolved
+        # ``num_kv_heads // tp_size`` for itself at construction time, so taking it
+        # from there cannot disagree with the consumer.
+        consumer = self._kv_consumer()
         self.transformer.language_model = _ReplayLanguageModel(
-            self.transformer.num_hidden_layers,
+            transformer.num_hidden_layers,
             language_model.rotary_emb,
+            num_kv_heads_local=consumer.num_kv_heads_local,
+            head_dim=consumer.head_dim,
         )
 
+    def _kv_consumer(self) -> torch.nn.Module:
+        """The ``Cosmos3CrossAttention`` that consumes the replayed UND K/V.
+
+        Every GEN block has one and they are all built from the same config, so the
+        first block speaks for all of them.
+        """
+        gen_layers = self.transformer.gen_layers
+        if not len(gen_layers):
+            raise RuntimeError(
+                "Cosmos3 generator stage has no GEN blocks, so there is nothing to "
+                "replay reasoner K/V into. _drop_unused_tower dropped the wrong tower."
+            )
+        return gen_layers[0].cross_attention
+
     def forward(self, req: Any) -> Any:  # type: ignore[override]
-        """Install the reasoner K/V, then run the stock denoise + decode path."""
-        self.install_und_kv(self._extract_und_payload(req))
-        return super().forward(req)
+        """Install the reasoner K/V, then run the stock denoise + decode path.
+
+        The payload is installed for the duration of this request only. The stub
+        outlives the request, so leaving a table behind would let a later request
+        replay another request's conditioning if its fingerprints happened to
+        match, and would pin the host K/V until the next request overwrote it.
+        """
+        payload = self._extract_und_payload(req)
+        self.install_und_kv(payload)
+        try:
+            return super().forward(req)
+        finally:
+            self.transformer.language_model.clear()
 
     @staticmethod
     def _extract_und_payload(req: Any) -> dict[str, Any]:
@@ -475,12 +621,47 @@ class Cosmos3GeneratorPipeline(_Cosmos3TowerPipeline):
                 "Cosmos3 generator stage is not running the replay UND stub; "
                 "the pipeline was not built by Cosmos3GeneratorPipeline."
             )
-        stub.install(table, dtype=self.transformer.proj_in.weight.dtype)
         meta = payload.get(META_KEY) or {}
+        self._check_meta_layout(meta, stub)
+        stub.install(table, dtype=self.transformer.proj_in.weight.dtype)
         logger.info(
             "Cosmos3 generator: installed reasoner K/V for %d branch(es) (%s MiB); UND tower skipped",
             len(table),
             meta.get("payload_mib", "?"),
+        )
+
+    def _check_meta_layout(self, meta: dict[str, Any], stub: _ReplayLanguageModel) -> None:
+        """Compare the reasoner's declared K/V layout with this stage's.
+
+        ``_ReplayLanguageModel.install`` already validates the tensors themselves,
+        so this is not what makes replay safe -- it is what makes a
+        stage-configuration mistake *diagnosable*. The reasoner reports the
+        ``tensor_parallel_size`` it sharded at, which no tensor shape reveals: a
+        payload built at TP 2 with 16 KV heads and one built at TP 1 with 8 are
+        indistinguishable by shape alone, so without this the operator sees a
+        shape mismatch with no hint that the two stages' TP sizes disagree.
+
+        Silent when the reasoner reported no layout at all (an older stage, or a
+        hand-built payload in a test); ``install`` still checks those.
+        """
+        expected = {
+            "num_layers": stub.num_hidden_layers,
+            "num_kv_heads_local": stub.num_kv_heads_local,
+            "head_dim": stub.head_dim,
+        }
+        mismatched = {
+            field: (meta[field], want) for field, want in expected.items() if field in meta and meta[field] != want
+        }
+        if not mismatched:
+            return
+        detail = ", ".join(
+            f"{field}={got} from reasoner, {want} here" for field, (got, want) in sorted(mismatched.items())
+        )
+        raise RuntimeError(
+            f"Cosmos3 reasoner and generator stages disagree on the UND K/V layout: {detail}. "
+            f"Reasoner ran at tensor_parallel_size={meta.get('tp_size', '?')}, this stage at "
+            f"{_tp_world_size()}. UND K/V is TP-sharded, so both stages must "
+            "load the same checkpoint and run with the same tensor_parallel_size."
         )
 
 

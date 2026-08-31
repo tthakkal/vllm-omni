@@ -74,10 +74,25 @@ class TestTopologyRegistration:
         assert stage.final_output is True
         assert stage.final_output_type == "image"
         assert stage.model_arch == COSMOS3_ARCH
-        assert COSMOS3_PIPELINE.default_deploy_config_name == COLOCATED_YAML
+
+    def test_colocated_topology_declares_no_default_deploy_config(self):
+        """Registering the topology must not change any existing deployment.
+
+        ``_get_deploy_config`` auto-loads a pipeline's default deploy YAML for
+        every caller that passes no ``--deploy-config``, so naming one here would
+        push device count, ``max_num_seqs``, ``enforce_eager``,
+        ``gpu_memory_utilization`` and the ``guardrails`` gate onto co-located
+        deployments that never asked for a deploy config, purely as a side effect
+        of this registration. ``COLOCATED_YAML`` is opt-in; it still has to exist
+        and parse, which ``TestColocatedDeployConfig`` covers.
+        """
+        assert COSMOS3_PIPELINE.default_deploy_config_name is None
 
     def test_disagg_topology_is_one_stage_per_tower(self):
         reasoner, generator = COSMOS3_DISAGG_PIPELINE.stages
+        # Safe to name here, unlike on the co-located config: this topology is
+        # unreachable without a deploy config that selects it by name, so by the
+        # time it resolves the caller has already supplied one.
         assert COSMOS3_DISAGG_PIPELINE.default_deploy_config_name == DISAGG_YAML
 
         assert (reasoner.stage_id, reasoner.model_stage) == (0, "reasoner")
@@ -202,19 +217,23 @@ class TestColocatedDeployConfig:
 
     def test_yaml_keeps_the_guardrail_models_out_of_the_default_path(self):
         """Cosmos3's pre-process hook eager-loads the *gated* guardrail models at
-        pipeline build time, so leaving them on makes the shipped default
-        hard-fail wherever `cosmos-guardrail` is not installed. `serve
-        --no-guardrails` and the offline example's `--extra-body` reach the same
-        setting; this only fixes the default."""
+        pipeline build time, so leaving them on makes this layout hard-fail
+        wherever `cosmos-guardrail` is not installed. `serve --no-guardrails` and
+        the offline example's `--extra-body` reach the same setting; `serve
+        --guardrails` overrides this line back on."""
         stage = _stage(_deploy(COLOCATED_YAML), 0)
         assert stage.engine_extras["model_config"]["guardrails"] is False
 
-    def test_yaml_pins_a_seed_so_the_default_path_is_reproducible(self):
-        """Request overrides work with or without this block -- an absent one still
-        yields OmniDiffusionSamplingParams() for the stage. It exists only so a
-        run that names no seed is reproducible."""
+    def test_yaml_pins_no_generation_parameters(self):
+        """A deployment file must not decide generation behaviour.
+
+        A pinned seed in particular would make every request that names no seed
+        return the same image for the life of the server; the rest
+        (num_inference_steps, guidance_scale, height, width) would shadow
+        Cosmos3's own T2I defaults while looking like deployment config.
+        """
         stage = _stage(_deploy(COLOCATED_YAML), 0)
-        assert stage.default_sampling_params["seed"] == 42
+        assert not stage.default_sampling_params
 
     def test_merges_into_a_single_image_stage(self):
         deploy = _deploy(COLOCATED_YAML)
@@ -227,7 +246,6 @@ class TestColocatedDeployConfig:
         # `devices` is what silently collapses the layout onto one GPU.
         assert stages[0].yaml_runtime["devices"] == _stage(deploy, 0).devices
         assert stages[0].yaml_engine_args["model_config"]["guardrails"] is False
-        assert stages[0].yaml_extras["default_sampling_params"]
 
 
 class TestDisaggDeployConfig:
@@ -249,7 +267,7 @@ class TestDisaggDeployConfig:
 
     @pytest.mark.parametrize("stage_id", [0, 1])
     def test_no_intra_stage_collectives(self, stage_id: int):
-        """Each tower fits uncut on one 141 GiB card: every degree is 1, HSDP off."""
+        """Each tower fits uncut on one H200 (141 GB): every degree is 1, HSDP off."""
         parallel = _stage(_deploy(DISAGG_YAML), stage_id).engine_extras["parallel_config"]
 
         assert parallel["use_hsdp"] is False
@@ -270,12 +288,30 @@ class TestDisaggDeployConfig:
 
         assert stage.engine_extras["model_config"]["guardrails"] is False
 
-    def test_stages_agree_on_default_sampling_params(self):
-        """A default that diverged per stage and affected tokenization or the CFG
-        decision would surface as a replay miss."""
+    def test_neither_stage_pins_generation_parameters(self):
+        """Per-stage generation defaults are actively dangerous in this topology.
+
+        The two towers must resolve the text conditioning identically -- the
+        reasoner encodes the unconditional branch only when guidance_scale > 1, and
+        the generator looks its branches up by a fingerprint of the tokenized
+        prompt, which depends on max_sequence_length, use_system_prompt and the
+        geometry. A default set on one stage and not the other makes them disagree
+        and the request fails with a replay miss. Shipping none on either side is
+        the only configuration that cannot diverge.
+        """
         stage0, stage1 = (_stage(_deploy(DISAGG_YAML), i) for i in (0, 1))
 
-        assert stage0.default_sampling_params == stage1.default_sampling_params
+        assert not stage0.default_sampling_params
+        assert not stage1.default_sampling_params
+
+    def test_both_stages_run_the_same_tensor_parallel_size(self):
+        """UND K/V is TP-sharded, so this is a correctness constraint, not a
+        preference: the reasoner emits [B, S, num_kv_heads // tp, head_dim] and the
+        generator's cross-attention consumes the shape *its own* TP size implies."""
+        stages = [_stage(_deploy(DISAGG_YAML), i) for i in (0, 1)]
+        tp_sizes = {s.engine_extras["parallel_config"]["tensor_parallel_size"] for s in stages}
+
+        assert len(tp_sizes) == 1
 
     def test_merges_into_reasoner_plus_generator(self):
         stages = merge_pipeline_deploy(COSMOS3_DISAGG_PIPELINE, _deploy(DISAGG_YAML))
@@ -287,7 +323,6 @@ class TestDisaggDeployConfig:
         assert stages[1].final_output_type == "image"
         assert stages[1].custom_process_input_func.endswith(".reasoner2generator")
         assert all(s.yaml_engine_args["model_config"]["guardrails"] is False for s in stages)
-        assert all(s.yaml_extras["default_sampling_params"] for s in stages)
 
 
 class TestDisaggDeviceMapping:

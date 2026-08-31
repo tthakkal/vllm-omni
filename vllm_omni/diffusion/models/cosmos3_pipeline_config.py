@@ -29,10 +29,20 @@ than the ``cached_kv`` attribute.
 
 Structurally this is the same handoff as GLM-Image's AR->DiT
 ``prior_token_ids`` bridge; the payload is per-layer K/V tensors instead of
-token ids. K/V is grouped-query (``num_key_value_heads=8``, ``head_dim=128``)
-over 64 layers and is trimmed to the real text length, so a few-hundred-token
-T2I prompt hands off tens of MiB once per request, against a GEN tower that then
-runs ``num_inference_steps`` times.
+token ids.
+
+PAYLOAD SIZE
+------------
+K/V is grouped-query (``num_key_value_heads=8``, ``head_dim=128``) and bf16, so
+one token costs ``8 * 128 * 2 bytes = 2 KiB`` per tensor, ``4 KiB`` per layer for
+K and V together, and ~``256 KiB`` per token per branch across 64 layers. It is
+trimmed to the real text length, but that length is what drives the total: a
+256-token formatted T2I prompt hands off ~64 MiB per branch, doubled to ~128 MiB
+when guidance is active and both branches are encoded. ``max_sequence_length``
+(4096 by default) is the hard ceiling and puts the worst case in the GiB range,
+so the reasoner logs the size and warns past
+``COSMOS3_UND_PAYLOAD_WARN_MIB``. That cost is paid once per request, against a
+GEN tower that then runs ``num_inference_steps`` times.
 
 WHAT DISAGGREGATION BUYS
 ------------------------
@@ -61,6 +71,12 @@ from vllm_omni.config.stage_config import (
 COSMOS3_UND_KV_KEY = "cosmos3_und_kv"
 COSMOS3_UND_META_KEY = "cosmos3_und_meta"
 
+#: Warn once per request when the reasoner -> generator K/V payload exceeds this
+#: size. Not a hard limit: an oversized payload is still correct, just expensive
+#: to serialize and ship (see PAYLOAD SIZE above). Sized so a normal T2I prompt
+#: with guidance stays quiet and a runaway ``max_sequence_length`` does not.
+COSMOS3_UND_PAYLOAD_WARN_MIB = 512.0
+
 COSMOS3_ARCH = "Cosmos3OmniDiffusersPipeline"
 COSMOS3_REASONER_ARCH = "Cosmos3ReasonerPipeline"
 COSMOS3_GENERATOR_ARCH = "Cosmos3GeneratorPipeline"
@@ -79,13 +95,23 @@ _COSMOS3_INPUT_PROCESSOR = "vllm_omni.model_executor.stage_input_processors.cosm
 # PipelineConfig and the engine builds a lone default stage from CLI kwargs. But
 # a deploy YAML is only read *through* this registry: with no entry,
 # ``create_stage_configs`` returns None and every field in a ``stages:`` YAML is
-# silently discarded. Cosmos3 has one setting that exists nowhere else --
-# ``model_config.guardrails`` -- which must be off at pipeline build time when
-# the gated guardrail models are unavailable, and which has no CLI flag. So
-# without this entry there is no way to serve Cosmos3 without guardrails.
+# silently discarded. So without this entry, no deploy YAML can configure
+# co-located Cosmos3 at all -- including the disaggregated topology below, which
+# is selected by a ``pipeline:`` key in exactly such a YAML.
+#
+# WHY IT DECLARES NO ``default_deploy_config_name``
+# -------------------------------------------------
+# ``_get_deploy_config`` auto-loads a pipeline's default deploy YAML whenever the
+# caller passes no ``--deploy-config``. Naming one here would therefore push a
+# whole set of deployment knobs -- device count, ``max_num_seqs``,
+# ``enforce_eager``, ``gpu_memory_utilization``, and the ``guardrails`` gate --
+# onto every existing co-located Cosmos3 deployment that had been running fine
+# without a deploy YAML, as a side effect of registering the topology. Two
+# separate changes, and only the first one belongs in this file.
+# ``deploy/cosmos3_super_t2i.yaml`` is the recommended single-GPU layout and is
+# opt-in: ``--deploy-config cosmos3_super_t2i.yaml``.
 COSMOS3_PIPELINE = PipelineConfig(
     model_type="cosmos3_omni",
-    default_deploy_config_name="cosmos3_super_t2i.yaml",
     model_arch="Cosmos3ForConditionalGeneration",
     # Safe to declare here, unlike on the disagg config below: this entry is
     # keyed on the checkpoint's real HF model_type, so it is found by the direct
@@ -111,6 +137,15 @@ COSMOS3_PIPELINE = PipelineConfig(
 )
 
 
+# Unlike the co-located entry above, naming a default deploy YAML here cannot
+# change anyone's defaults: this topology is unreachable without a deploy config
+# that selects it by name (see ``hf_architectures`` below), so by the time this
+# config is resolved the caller has already supplied one and
+# ``_get_deploy_config`` returns that instead. It is declared for the one path
+# that does reach it -- selecting the topology programmatically, e.g.
+# ``get_pipeline_config(pipeline="cosmos3_omni_disagg")`` with no deploy path --
+# where the two-stage device map is not something a caller should have to
+# reconstruct by hand.
 COSMOS3_DISAGG_PIPELINE = PipelineConfig(
     model_type="cosmos3_omni_disagg",
     default_deploy_config_name="cosmos3_super_t2i_disagg.yaml",

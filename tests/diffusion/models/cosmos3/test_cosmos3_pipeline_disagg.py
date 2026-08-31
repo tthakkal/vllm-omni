@@ -17,6 +17,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3_disagg as disagg
 from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniDiffusersPipeline
 from vllm_omni.diffusion.models.cosmos3.pipeline_cosmos3_disagg import (
     Cosmos3GeneratorPipeline,
@@ -67,13 +68,43 @@ class StubUndTower(nn.Module):
         ]
 
 
+class StubCrossAttention(nn.Module):
+    """Stands in for ``Cosmos3CrossAttention``: the consumer of the replayed K/V.
+
+    The real one resolves ``num_kv_heads // tp_size`` at construction time and the
+    generator reads the expected replay shape straight off it, so the stub has to
+    carry the same two attributes.
+    """
+
+    def __init__(self, num_kv_heads_local: int = KV_HEADS, head_dim: int = HEAD_DIM) -> None:
+        super().__init__()
+        self.num_kv_heads_local = num_kv_heads_local
+        self.head_dim = head_dim
+
+
+class StubGenBlock(nn.Module):
+    """Stands in for ``Cosmos3GenDecoderLayer``."""
+
+    def __init__(self, num_kv_heads_local: int = KV_HEADS, head_dim: int = HEAD_DIM) -> None:
+        super().__init__()
+        self.cross_attention = StubCrossAttention(num_kv_heads_local, head_dim)
+        self.mlp = nn.Linear(1, 1)
+
+
 class StubTowerTransformer(nn.Module):
     """The parts of ``Cosmos3VFMTransformer`` the two tower pipelines touch."""
 
-    def __init__(self, num_layers: int = NUM_LAYERS, *, fsdp: bool = False) -> None:
+    def __init__(
+        self,
+        num_layers: int = NUM_LAYERS,
+        *,
+        fsdp: bool = False,
+        num_kv_heads_local: int = KV_HEADS,
+        head_dim: int = HEAD_DIM,
+    ) -> None:
         super().__init__()
         self.language_model = StubUndTower(num_layers)
-        self.gen_layers = nn.ModuleList(nn.Linear(1, 1) for _ in range(num_layers))
+        self.gen_layers = nn.ModuleList(StubGenBlock(num_kv_heads_local, head_dim) for _ in range(num_layers))
         self.proj_in = nn.Linear(HEAD_DIM, HEAD_DIM)
         self.num_hidden_layers = num_layers
         self.rope_calls: list[dict[str, Any]] = []
@@ -184,14 +215,34 @@ def make_reasoner():
 
 @pytest.fixture
 def make_generator():
-    def _make(*, num_layers: int = NUM_LAYERS):
+    def _make(
+        *,
+        num_layers: int = NUM_LAYERS,
+        num_kv_heads_local: int = KV_HEADS,
+        head_dim: int = HEAD_DIM,
+    ):
         pipeline = object.__new__(Cosmos3GeneratorPipeline)
         nn.Module.__init__(pipeline)
-        pipeline.transformer = StubTowerTransformer(num_layers)
+        pipeline.transformer = StubTowerTransformer(
+            num_layers,
+            num_kv_heads_local=num_kv_heads_local,
+            head_dim=head_dim,
+        )
         pipeline.device = torch.device("cpu")
         return pipeline
 
     return _make
+
+
+def _entry(num_layers: int = NUM_LAYERS, seq: int = 2, fill: float = 0.0) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """One branch of a reasoner payload, shaped [B, S_und, H_kv_local, D] per layer."""
+    return [
+        (
+            torch.full((1, seq, KV_HEADS, HEAD_DIM), fill),
+            torch.full((1, seq, KV_HEADS, HEAD_DIM), fill),
+        )
+        for _ in range(num_layers)
+    ]
 
 
 # =============================================================================
@@ -254,12 +305,17 @@ class TestDropBlocks:
 
 class TestReplayLanguageModel:
     def _stub(self, num_layers: int = NUM_LAYERS) -> _ReplayLanguageModel:
-        return _ReplayLanguageModel(num_layers, nn.Identity())
+        return _ReplayLanguageModel(
+            num_layers,
+            nn.Identity(),
+            num_kv_heads_local=KV_HEADS,
+            head_dim=HEAD_DIM,
+        )
 
     def test_attribute_surface_the_transformer_relies_on(self):
         """``_compute_rope_freqs`` needs rotary_emb; offload needs ``layers``."""
         rotary = nn.Identity()
-        stub = _ReplayLanguageModel(NUM_LAYERS, rotary)
+        stub = _ReplayLanguageModel(NUM_LAYERS, rotary, num_kv_heads_local=KV_HEADS, head_dim=HEAD_DIM)
 
         assert stub.rotary_emb is rotary
         assert isinstance(stub.layers, nn.ModuleList)
@@ -274,7 +330,7 @@ class TestReplayLanguageModel:
 
     def test_replays_the_installed_branch(self):
         text_ids = _ids(11, 12)
-        entry = [(torch.zeros(1, 2, KV_HEADS, HEAD_DIM), torch.ones(1, 2, KV_HEADS, HEAD_DIM))] * NUM_LAYERS
+        entry = _entry()
         stub = self._stub()
         stub.install({fingerprint_text_ids(text_ids): entry}, dtype=torch.bfloat16)
 
@@ -289,7 +345,7 @@ class TestReplayLanguageModel:
     def test_accepts_lists_instead_of_tuples(self):
         """Stage serializers turn the K/V tuples into lists on the way across."""
         text_ids = _ids(11, 12)
-        entry = [[torch.zeros(1, 2, KV_HEADS, HEAD_DIM), torch.ones(1, 2, KV_HEADS, HEAD_DIM)]] * NUM_LAYERS
+        entry = [list(pair) for pair in _entry()]
         stub = self._stub()
         stub.install({fingerprint_text_ids(text_ids): entry})
 
@@ -298,19 +354,19 @@ class TestReplayLanguageModel:
     def test_keeps_cfg_branches_apart(self):
         cond, uncond = _ids(11, 12), _ids(21, 22)
         table = {
-            fingerprint_text_ids(cond): [(torch.zeros(1, 2, 1, 1), torch.zeros(1, 2, 1, 1))] * NUM_LAYERS,
-            fingerprint_text_ids(uncond): [(torch.ones(1, 2, 1, 1), torch.ones(1, 2, 1, 1))] * NUM_LAYERS,
+            fingerprint_text_ids(cond): _entry(fill=0.0),
+            fingerprint_text_ids(uncond): _entry(fill=1.0),
         }
         stub = self._stub()
         stub.install(table)
 
         assert stub(cond, freqs=None)[0][0].sum() == 0
-        assert stub(uncond, freqs=None)[0][0].sum() == 2  # two replayed positions of ones
+        assert stub(uncond, freqs=None)[0][0].sum() == 2 * KV_HEADS * HEAD_DIM
 
     def test_fingerprint_miss_raises_loudly(self):
         """A tokenization divergence must not silently produce a wrong image."""
         stub = self._stub()
-        stub.install({fingerprint_text_ids(_ids(11, 12)): [(torch.zeros(1, 1), torch.zeros(1, 1))] * NUM_LAYERS})
+        stub.install({fingerprint_text_ids(_ids(11, 12)): _entry()})
 
         with pytest.raises(RuntimeError, match="no reasoner K/V for this prompt"):
             stub(_ids(99, 98), freqs=None)
@@ -319,12 +375,55 @@ class TestReplayLanguageModel:
         with pytest.raises(RuntimeError, match="no reasoner K/V"):
             self._stub()(_ids(11, 12), freqs=None)
 
-    def test_layer_count_mismatch_raises(self):
-        text_ids = _ids(11, 12)
-        stub = self._stub(num_layers=NUM_LAYERS)
-        stub.install({fingerprint_text_ids(text_ids): [(torch.zeros(1, 1), torch.zeros(1, 1))]})
+    def test_install_rejects_a_layer_count_mismatch(self):
+        """Checked at install time, once per request, rather than once per step."""
+        stub = self._stub()
 
-        with pytest.raises(RuntimeError, match="has 1 layers, generator expects 3"):
+        with pytest.raises(RuntimeError, match="has 1 layer.*generator expects 3"):
+            stub.install({fingerprint_text_ids(_ids(11, 12)): _entry(num_layers=1)})
+
+    def test_install_rejects_a_kv_head_count_from_a_different_tp_size(self):
+        """A payload sharded at another TP size is the failure mode the shape check
+        exists for: unchecked it is either a shape error deep inside attention or,
+        worse, silently wrong conditioning."""
+        stub = self._stub()
+        entry = [(torch.zeros(1, 2, KV_HEADS * 2, HEAD_DIM), torch.zeros(1, 2, KV_HEADS * 2, HEAD_DIM))] * NUM_LAYERS
+
+        with pytest.raises(RuntimeError, match="TP-sharded"):
+            stub.install({fingerprint_text_ids(_ids(11, 12)): entry})
+
+    def test_install_rejects_a_wrong_head_dim(self):
+        stub = self._stub()
+        entry = [(torch.zeros(1, 2, KV_HEADS, HEAD_DIM + 1), torch.zeros(1, 2, KV_HEADS, HEAD_DIM + 1))] * NUM_LAYERS
+
+        with pytest.raises(RuntimeError, match="this generator stage consumes"):
+            stub.install({fingerprint_text_ids(_ids(11, 12)): entry})
+
+    def test_install_rejects_a_non_4d_tensor(self):
+        stub = self._stub()
+        entry = [(torch.zeros(1, 2), torch.zeros(1, 2))] * NUM_LAYERS
+
+        with pytest.raises(RuntimeError, match="expected 4"):
+            stub.install({fingerprint_text_ids(_ids(11, 12)): entry})
+
+    def test_install_rejects_k_and_v_of_different_shapes(self):
+        stub = self._stub()
+        entry = [(torch.zeros(1, 2, KV_HEADS, HEAD_DIM), torch.zeros(1, 3, KV_HEADS, HEAD_DIM))] * NUM_LAYERS
+
+        with pytest.raises(RuntimeError, match="disagree on shape"):
+            stub.install({fingerprint_text_ids(_ids(11, 12)): entry})
+
+    def test_clear_drops_the_payload(self):
+        """A payload belongs to one request; the stub outlives it."""
+        text_ids = _ids(11, 12)
+        stub = self._stub()
+        stub.install({fingerprint_text_ids(text_ids): _entry()}, dtype=torch.bfloat16)
+
+        stub.clear()
+
+        assert stub._table == {}
+        assert stub._dtype is None
+        with pytest.raises(RuntimeError, match="no reasoner K/V"):
             stub(text_ids, freqs=None)
 
 
@@ -386,6 +485,40 @@ class TestReasonerPipeline:
         assert meta["num_branches"] == 2
         # Reported for logging only, rounded to 0.1 MiB -- a stub payload floors to 0.0.
         assert isinstance(meta["payload_mib"], float)
+
+    def test_meta_reports_the_kv_layout_read_off_the_tensors(self, make_reasoner):
+        """The generator compares these against its own cross-attention to name a
+        stage-configuration mismatch. Read from the emitted tensors rather than the
+        config, so the metadata cannot describe a payload this stage did not send."""
+        pipeline = make_reasoner()
+
+        payload = pipeline.encode_prompt_to_kv("a red car", "", _sampling_params())
+
+        meta = payload[META_KEY]
+        assert meta["num_layers"] == NUM_LAYERS
+        assert meta["num_kv_heads_local"] == KV_HEADS
+        assert meta["head_dim"] == HEAD_DIM
+        # No TP group in a single-process test, which is TP 1 by definition.
+        assert meta["tp_size"] == 1
+
+    def test_oversized_payload_warns_but_still_ships(self, make_reasoner, monkeypatch, caplog):
+        """An oversized payload is correct, just expensive -- so warn, do not raise."""
+        monkeypatch.setattr(disagg, "COSMOS3_UND_PAYLOAD_WARN_MIB", 0.0)
+        pipeline = make_reasoner()
+
+        with caplog.at_level("WARNING"):
+            payload = pipeline.encode_prompt_to_kv("a red car", "", _sampling_params())
+
+        assert payload[KV_KEY]
+        assert "max_sequence_length" in caplog.text
+
+    def test_normal_payload_does_not_warn(self, make_reasoner, caplog):
+        pipeline = make_reasoner()
+
+        with caplog.at_level("WARNING"):
+            pipeline.encode_prompt_to_kv("a red car", "", _sampling_params())
+
+        assert "K/V payload is" not in caplog.text
 
     def test_geometry_and_tokenizer_settings_reach_the_tokenizer(self, make_reasoner):
         pipeline = make_reasoner()
@@ -519,6 +652,63 @@ class TestGeneratorPipeline:
         # The GEN tower is the one this stage actually runs.
         assert len(pipeline.transformer.gen_layers) == NUM_LAYERS
 
+    def test_stub_takes_its_expected_layout_from_the_consuming_cross_attention(self, make_generator):
+        """Read from the module that will receive the tensors, not recomputed from
+        the config and TP size, so it cannot disagree with the consumer."""
+        pipeline = make_generator(num_kv_heads_local=4, head_dim=64)
+
+        pipeline._drop_unused_tower()
+
+        stub = pipeline.transformer.language_model
+        assert (stub.num_kv_heads_local, stub.head_dim) == (4, 64)
+
+    def test_dropping_the_wrong_tower_is_caught(self, make_generator):
+        """Without GEN blocks there is no cross-attention to describe the layout and
+        nothing to replay into -- a bug in this class, so say so."""
+        pipeline = make_generator()
+        del pipeline.transformer.gen_layers[:]
+
+        with pytest.raises(RuntimeError, match="no GEN blocks"):
+            pipeline._drop_unused_tower()
+
+    def test_forward_clears_the_payload_when_the_denoise_loop_finishes(self, make_generator, monkeypatch):
+        """The payload belongs to one request but the stub is long-lived pipeline
+        state, so a table left installed could be replayed by a later request."""
+        pipeline = make_generator()
+        pipeline._drop_unused_tower()
+        table = {fingerprint_text_ids(_ids(11, 12)): _entry()}
+        req = SimpleNamespace(prompts=[{"prompt": "x", "extra": {KV_KEY: table}}], sampling_params=None)
+
+        installed: list[dict[str, Any]] = []
+
+        def _record_then_return_image(self, _req):
+            """Snapshot the replay table from inside the denoise loop."""
+            installed.append(dict(self.transformer.language_model._table))
+            return "image"
+
+        monkeypatch.setattr(Cosmos3OmniDiffusersPipeline, "forward", _record_then_return_image)
+
+        assert pipeline.forward(req) == "image"
+        # Installed for the duration of the denoise loop, gone afterwards.
+        assert installed == [table]
+        assert pipeline.transformer.language_model._table == {}
+
+    def test_forward_clears_the_payload_even_when_denoising_raises(self, make_generator, monkeypatch):
+        pipeline = make_generator()
+        pipeline._drop_unused_tower()
+        table = {fingerprint_text_ids(_ids(11, 12)): _entry()}
+        req = SimpleNamespace(prompts=[{"prompt": "x", "extra": {KV_KEY: table}}], sampling_params=None)
+
+        def _boom(self, _req):
+            raise RuntimeError("denoise exploded")
+
+        monkeypatch.setattr(Cosmos3OmniDiffusersPipeline, "forward", _boom)
+
+        with pytest.raises(RuntimeError, match="denoise exploded"):
+            pipeline.forward(req)
+
+        assert pipeline.transformer.language_model._table == {}
+
     def test_extracts_the_payload_from_the_prompt(self):
         payload = {KV_KEY: {"fp": []}, META_KEY: {"height": 1024}}
         req = SimpleNamespace(prompts=[{"prompt": "x", "extra": payload}], sampling_params=None)
@@ -558,8 +748,7 @@ class TestGeneratorPipeline:
         pipeline = make_generator()
         pipeline._drop_unused_tower()
         text_ids = _ids(11, 12)
-        entry = [(torch.zeros(1, 2, 1, 1), torch.ones(1, 2, 1, 1))] * NUM_LAYERS
-        table = {fingerprint_text_ids(text_ids): entry}
+        table = {fingerprint_text_ids(text_ids): _entry()}
 
         pipeline.install_und_kv({KV_KEY: table, META_KEY: {"payload_mib": 1.0}})
 
@@ -567,6 +756,32 @@ class TestGeneratorPipeline:
         assert stub._table is table
         assert stub._dtype == pipeline.transformer.proj_in.weight.dtype
         assert len(stub(text_ids, freqs=None)) == NUM_LAYERS
+
+    def test_install_und_kv_rejects_a_layout_the_reasoner_declares_differently(self, make_generator):
+        """The shape check in ``install`` already makes replay safe; this check is
+        what makes a TP-size mistake diagnosable, since no shape reveals TP size."""
+        pipeline = make_generator()
+        pipeline._drop_unused_tower()
+        table = {fingerprint_text_ids(_ids(11, 12)): _entry()}
+        meta = {"num_kv_heads_local": KV_HEADS * 2, "tp_size": 2, "head_dim": HEAD_DIM}
+
+        with pytest.raises(RuntimeError, match="disagree on the UND K/V layout") as excinfo:
+            pipeline.install_und_kv({KV_KEY: table, META_KEY: meta})
+
+        message = str(excinfo.value)
+        assert f"num_kv_heads_local={KV_HEADS * 2} from reasoner, {KV_HEADS} here" in message
+        assert "tensor_parallel_size=2" in message
+
+    def test_install_und_kv_accepts_a_payload_that_declares_no_layout(self, make_generator):
+        """An older reasoner, or a hand-built payload in a test: ``install`` still
+        validates the tensors themselves."""
+        pipeline = make_generator()
+        pipeline._drop_unused_tower()
+        table = {fingerprint_text_ids(_ids(11, 12)): _entry()}
+
+        pipeline.install_und_kv({KV_KEY: table, META_KEY: {"payload_mib": 1.0}})
+
+        assert pipeline.transformer.language_model._table is table
 
     def test_install_und_kv_rejects_an_empty_payload(self, make_generator):
         pipeline = make_generator()
@@ -677,3 +892,88 @@ class TestDisaggRegistryWiring:
         assert CUSTOM_DIT_ENABLERS["Cosmos3GeneratorPipeline"] is CUSTOM_DIT_ENABLERS["Cosmos3OmniDiffusersPipeline"]
         # The reasoner has no gen_layers and no denoising steps to cache.
         assert "Cosmos3ReasonerPipeline" not in CUSTOM_DIT_ENABLERS
+
+
+# =============================================================================
+# Shared text-conditioning resolvers
+# =============================================================================
+
+
+class TestSharedConditioningResolvers:
+    """The two stages must resolve the tokenizer's inputs from one implementation.
+
+    The generator finds its replayed K/V by fingerprinting the token ids it
+    tokenizes itself, so anything feeding the tokenizer -- geometry,
+    ``max_sequence_length``, ``use_system_prompt`` -- has to come out the same on
+    both stages for the same sampling params. A divergence here does not produce a
+    slightly different image; it produces a replay miss and a failed request.
+    These tests pin the single implementation in place rather than re-testing its
+    behaviour, which ``TestReasonerPipeline`` already covers end to end.
+    """
+
+    @pytest.mark.parametrize(
+        "helper",
+        ["_resolve_t2i_geometry", "_resolve_text_encode_params", "_resolve_guidance_scale"],
+    )
+    @pytest.mark.parametrize("stage", [Cosmos3ReasonerPipeline, Cosmos3GeneratorPipeline])
+    def test_neither_tower_overrides_the_shared_resolvers(self, stage: type, helper: str):
+        """An override on one tower is the failure mode this whole class exists for."""
+        assert getattr(stage, helper) is getattr(Cosmos3OmniDiffusersPipeline, helper)
+
+    @pytest.mark.parametrize("helper", ["_resolve_t2i_geometry", "_resolve_text_encode_params"])
+    def test_the_colocated_t2i_path_still_routes_through_them(self, helper: str):
+        """The resolvers are only shared while the stock ``forward`` uses them too.
+
+        Inlining the defaults back into ``forward`` would leave the reasoner
+        resolving them alone -- the co-located path would keep working, so nothing
+        else here would fail. Exercising the real ``forward`` needs a loaded 31B
+        checkpoint, so this reads the source instead.
+        """
+        import inspect
+
+        source = inspect.getsource(Cosmos3OmniDiffusersPipeline.forward)
+
+        assert f"self.{helper}(" in source
+
+    def test_both_stages_resolve_identical_tokenizer_inputs(self, make_reasoner, make_generator):
+        """Same sampling params in, same values out, across a spread of inputs.
+
+        Bound to instances of both stage classes, because the geometry default
+        depends on ``self.is_edge_model``.
+        """
+        reasoner = make_reasoner()
+        generator = make_generator()
+        generator.is_edge_model = False
+
+        for sp in (
+            _sampling_params(),
+            _sampling_params(height=512, width=768),
+            _sampling_params(max_sequence_length=256),
+            _sampling_params(extra_args={"use_system_prompt": True}),
+            _sampling_params(extra_args={"max_sequence_length": 128}),
+        ):
+            assert reasoner._resolve_t2i_geometry(sp) == generator._resolve_t2i_geometry(sp)
+            assert reasoner._resolve_text_encode_params(
+                sp, default_use_system_prompt=False
+            ) == generator._resolve_text_encode_params(sp, default_use_system_prompt=False)
+
+    def test_the_reasoner_encodes_at_the_resolved_values(self, make_reasoner):
+        """Closes the loop: the values the resolver returns are the ones that reach
+        the tokenizer, so the parity above is parity of what actually gets hashed."""
+        pipeline = make_reasoner()
+        sp = _sampling_params(height=512, width=768, extra_args={"max_sequence_length": 128})
+
+        payload = pipeline.encode_prompt_to_kv("a red car", "", sp)
+
+        height, width = pipeline._resolve_t2i_geometry(sp)
+        max_sequence_length, use_system_prompt, _ = pipeline._resolve_text_encode_params(
+            sp, default_use_system_prompt=False
+        )
+        call = pipeline.tokenize_calls[0]
+        assert (call["height"], call["width"]) == (height, width)
+        assert call["max_sequence_length"] == max_sequence_length
+        assert call["use_system_prompt"] is use_system_prompt
+        # And the metadata describes the same resolution, so a mismatch reported by
+        # the generator names the values the reasoner really used.
+        assert payload[META_KEY]["height"] == height
+        assert payload[META_KEY]["max_sequence_length"] == max_sequence_length
