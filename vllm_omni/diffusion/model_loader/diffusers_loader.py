@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import contextlib
 import dataclasses
 import glob
@@ -34,6 +34,7 @@ from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig, apply_hsdp
 from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
     get_checkpoint_adapter,
 )
+from vllm_omni.diffusion.model_loader.host_weight_loader import HWRLoaderMixin, _HWRCommitError
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
     build_checkpoint_mmap_plan,
@@ -125,7 +126,7 @@ def _resolve_custom_pipeline_cls(custom_pipeline_name: str | type | None) -> typ
     )
 
 
-class DiffusersPipelineLoader:
+class DiffusersPipelineLoader(HWRLoaderMixin):
     """Model loader that can load diffusers pipeline components from disk."""
 
     @dataclasses.dataclass
@@ -159,6 +160,9 @@ class DiffusersPipelineLoader:
         self.quant_config = od_config.quantization_config
         self.parallel_config = od_config.parallel_config
         self.host_weight_plan: HostWeightPlan | None = None
+        self._hwr_state: dict[str, object] | None = None
+        self._last_load_request: dict[str, object] | None = None
+        self._force_canonical_load = False
 
     def take_host_weight_plan(self) -> HostWeightPlan | None:
         """Transfer the loader-produced plan to the offload backend."""
@@ -259,7 +263,7 @@ class DiffusersPipelineLoader:
             allow_patterns = allow_patterns_overrides
 
         if not is_local and indexed_weight_files is not None:
-            hf_folder = download_weights_from_hf_specific(
+            hf_folder: Path | str = download_weights_from_hf_specific(
                 model_name_or_path=str(model_name_or_path),
                 cache_dir=self.load_config.download_dir,
                 allow_patterns=[self._repo_relative_path(subfolder, filename) for filename in indexed_weight_files],
@@ -353,8 +357,9 @@ class DiffusersPipelineLoader:
 
     def _get_source_quant_config(self, source: "ComponentSource") -> object | None:
         quant_config = self.quant_config
-        if hasattr(quant_config, "resolve"):
-            return quant_config.resolve(source.prefix.rstrip("."))
+        resolve = getattr(quant_config, "resolve", None)
+        if resolve is not None:
+            return resolve(source.prefix.rstrip("."))
         return quant_config
 
     def _get_checkpoint_adapter(
@@ -469,6 +474,13 @@ class DiffusersPipelineLoader:
     ) -> nn.Module:
         """Load a model with the given configurations."""
         self.host_weight_plan = None
+        self._hwr_state = None
+        self._last_load_request = {
+            "load_device": load_device,
+            "load_format": load_format,
+            "custom_pipeline_name": custom_pipeline_name,
+            "device": device,
+        }
         if load_format is None:
             load_format = "default"
         # CPU offload + quantization: for offline-quantized models (e.g., AutoRound MXFP8),
@@ -511,7 +523,34 @@ class DiffusersPipelineLoader:
 
                 plan_result = None
                 weight_sources = self._get_weight_sources(model)
-                if _dist_offload:
+                hwr_state = None
+                if not self._force_canonical_load:
+                    try:
+                        hwr_state = self._resolve_hwr(
+                            model,
+                            ModuleDiscovery.discover(model),
+                            dist_offload=_dist_offload,
+                            use_allgather=_use_ag,
+                            load_format=load_format,
+                            sources=weight_sources,
+                        )
+                    except _HWRCommitError:
+                        from vllm_omni.host_weight_runtime import RuntimeMode
+
+                        mode = RuntimeMode(getattr(self.od_config, "host_weight_runtime_mode", "disabled"))
+                        if mode is not RuntimeMode.PREFERRED:
+                            raise
+                        logger.warning(
+                            "HWR restore commit failed; discarding the model and retrying a fresh canonical load",
+                            exc_info=True,
+                        )
+                        del model
+                        return self.load_fresh_canonical_model()
+                self._hwr_state = hwr_state
+                hwr_active = hwr_state is not None
+                if hwr_active and hwr_state is not None:
+                    self.host_weight_plan = cast(HostWeightPlan | None, hwr_state.get("plan"))
+                if _dist_offload and not hwr_active and not self._force_canonical_load:
                     modules = ModuleDiscovery.discover(model)
                     plan_result = build_checkpoint_mmap_plan(
                         model,
@@ -524,19 +563,19 @@ class DiffusersPipelineLoader:
                     )
                     self.host_weight_plan = plan_result.plan
 
-                _skip_load = self.host_weight_plan is not None
+                host_weight_plan = self.host_weight_plan
 
-                if _skip_load:
+                if host_weight_plan is not None:
                     logger.info(
                         "DLO host-weight plan active (%s, %s): skipping ordinary materialization for %s",
                         "AllGather" if _use_ag and _dlo_group_size > 1 else "rank-local",
-                        self.host_weight_plan.backing_kind,
-                        sorted(self.host_weight_plan.planned_source_prefixes) or "legacy DiT sources",
+                        host_weight_plan.backing_kind,
+                        sorted(host_weight_plan.planned_source_prefixes) or "legacy DiT sources",
                     )
                     ordinary_sources = tuple(
                         source
                         for source in weight_sources
-                        if source.prefix not in self.host_weight_plan.planned_source_prefixes
+                        if source.prefix not in host_weight_plan.planned_source_prefixes
                     )
                     if ordinary_sources:
                         logger.info(
@@ -546,21 +585,25 @@ class DiffusersPipelineLoader:
                         self.load_weights(
                             model,
                             sources=ordinary_sources,
-                            planned_weights=self.host_weight_plan.bindings,
+                            planned_weights=host_weight_plan.bindings,
                         )
                 else:
-                    if _dist_offload and _use_ag and _has_online_quant:
+                    if _dist_offload and _use_ag and _dlo_group_size > 1 and _has_online_quant:
+                        # An effective DLO group size of one performs no weight
+                        # collective, so the AllGather layout allowlist does not
+                        # apply there even with dlo_use_allgather=True.
                         unsupported_methods = self._unsupported_dlo_allgather_online_quant_methods(model)
                         if unsupported_methods:
                             raise ValueError(
                                 "DLO+AllGather supports online quantization only for "
-                                "per-tensor FP8 linears; unsupported online methods: "
-                                f"{', '.join(unsupported_methods)}. Please use "
+                                "per-tensor FP8, INT8, and MXFP8 linears; unsupported online "
+                                f"methods: {', '.join(unsupported_methods)}. Please use "
                                 "--dlo-no-use-allgather or disable online quantization."
                             )
                         logger.info(
-                            "Online per-tensor FP8 with DLO+AllGather: using the "
-                            "ordinary loader before sharding finalized weights and scales"
+                            "Validated online methods (per-tensor FP8, INT8, MXFP8) with "
+                            "DLO+AllGather: using the ordinary loader before sharding "
+                            "finalized weights and scales"
                         )
                     if _dist_offload and plan_result is not None:
                         logger.info(
@@ -584,12 +627,43 @@ class DiffusersPipelineLoader:
                             self.load_weights(model)
                     self._process_weights_after_loading(model, target_device)
 
+                # A warm final-layout hit has already completed all
+                # byte-changing work through the restorer.  Shared runtime
+                # finalization happens once at the end for both cold and warm
+                # paths; the warm path never re-enters the ordinary
+                # materialization/finalization pipeline.
+
             if offload_after_quant:
                 model.to("cpu")
                 logger.info("Quantization complete, offloaded model back to CPU")
 
-        self._apply_skip_softmax_calibration(model)
-        return model.eval()
+        try:
+            self._apply_skip_softmax_calibration(model)
+            model = model.eval()
+            if self._hwr_state is not None:
+                warm_snapshot = self._hwr_state.get("warm_snapshot")
+                if warm_snapshot is not None:
+                    self._assert_final_layout_tensors_unchanged(model, cast(dict[str, tuple[int, str]], warm_snapshot))
+                self._publish_hwr_after_load(model, ModuleDiscovery.discover(model), self._hwr_state)
+        except Exception:
+            hwr_plan = self._hwr_state.get("plan") if self._hwr_state is not None else None
+            if isinstance(hwr_plan, HostWeightPlan):
+                carrier = hwr_plan.lease_carrier
+                if carrier is not None:
+                    carrier.close()
+                from vllm_omni.host_weight_runtime import RuntimeMode
+
+                mode = RuntimeMode(getattr(self.od_config, "host_weight_runtime_mode", "disabled"))
+                if mode is RuntimeMode.PREFERRED:
+                    logger.warning(
+                        "HWR warm finalization failed; discarding the model and retrying a fresh canonical load",
+                        exc_info=True,
+                    )
+                    del model
+                    return self.load_fresh_canonical_model()
+            raise
+        self._attach_offload_startup_state(model)
+        return model
 
     @staticmethod
     def _request_offload_after_quant(model: nn.Module) -> int:
@@ -609,9 +683,10 @@ class DiffusersPipelineLoader:
         marked = 0
         for module in model.modules():
             quant_method = getattr(module, "quant_method", None)
-            if getattr(quant_method, "supports_offload_after_quant", False):
-                quant_method.enable_offload_after_quant()
-                marked += 1
+            if quant_method is None or not getattr(quant_method, "supports_offload_after_quant", False):
+                continue
+            quant_method.enable_offload_after_quant()
+            marked += 1
         return marked
 
     @staticmethod
@@ -625,14 +700,54 @@ class DiffusersPipelineLoader:
     def _unsupported_dlo_allgather_online_quant_methods(model: nn.Module) -> tuple[str, ...]:
         """Return unsupported online-quant methods for DLO AllGather.
 
-        Per-tensor online FP8 is safe after the ordinary loader has finalized
-        its weight and scale parameters. DLO shards those runtime tensors by
-        dtype and reconstructs their recorded shapes and strides before the
-        kernel consumes them. Other online methods may create different scale,
-        packing, or aliasing layouts and remain fail-closed until validated.
+        Per-tensor online FP8, online INT8, and online MXFP8 are safe after
+        the ordinary loader has finalized their weight and scale parameters.
+        DLO shards those runtime tensors by dtype and reconstructs their
+        recorded shapes and strides before the kernel consumes them. They all
+        keep plain transportable 1-byte dtypes over ordinary strided views:
+
+        - online INT8: int8 weight plus fp32 scale, either contiguous (NPU,
+          pre-transposed (K, N)) or a transposed view (CUDA, stride (1, K));
+        - online MXFP8: fp8 weight plus e8m0 block scale, either contiguous
+          (NPU: (K, N) weight with (K_groups/2, N, 2) scale) or with the
+          scale stored as a transposed view (vLLM kernel, .t() over a
+          contiguous (K/32, N) buffer).
+
+        Both shape families are already covered by the physical-order packing
+        that online FP8 requires. Other online methods may create different
+        scale, packing, or aliasing layouts (e.g. dual-scale fp4 pairs,
+        swizzled or NZ hardware formats) and remain fail-closed until
+        validated.
         """
         from vllm.model_executor.layers.quantization.online.fp8 import (
             Fp8PerTensorOnlineLinearMethod,
+        )
+
+        from vllm_omni.quantization.int8_config import (
+            Int8OnlineLinearMethod,
+            NPUInt8OnlineLinearMethod,
+        )
+
+        try:
+            from vllm_omni.quantization.mxfp8_config import (
+                NPUMxfp8OnlineLinearMethod,
+                VllmMxfp8OnlineLinearMethod,
+            )
+
+            mxfp8_online_methods: tuple[type, ...] = (
+                NPUMxfp8OnlineLinearMethod,
+                VllmMxfp8OnlineLinearMethod,
+            )
+        except ImportError:
+            # MXFP8 requires a vLLM build with MXFP8 kernel support; treat it
+            # as absent when the module cannot be imported.
+            mxfp8_online_methods = ()
+
+        allowed_online_methods: tuple[type, ...] = (
+            Fp8PerTensorOnlineLinearMethod,
+            Int8OnlineLinearMethod,
+            NPUInt8OnlineLinearMethod,
+            *mxfp8_online_methods,
         )
 
         unsupported: set[str] = set()
@@ -640,7 +755,7 @@ class DiffusersPipelineLoader:
             quant_method = getattr(module, "quant_method", None)
             if not getattr(quant_method, "uses_meta_device", False):
                 continue
-            if not isinstance(quant_method, Fp8PerTensorOnlineLinearMethod):
+            if not isinstance(quant_method, allowed_online_methods):
                 unsupported.add(type(quant_method).__name__)
         return tuple(sorted(unsupported))
 
