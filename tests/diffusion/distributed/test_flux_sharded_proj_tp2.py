@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Real two-rank coverage for the FLUX sharded single-block projection path.
 
 ``tests/diffusion/models/flux/test_flux_transformer_sharded_proj.py`` only
@@ -31,11 +31,17 @@ import pytest
 import torch
 
 from tests.helpers.mark import hardware_marks
-from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.data import (
+    DiffusionParallelConfig,
+    OmniDiffusionConfig,
+    TransformerConfig,
+)
 
 _TWO_CARD = hardware_marks(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=2)
 
 DeviceKind = Literal["cpu", "device"]
+
+_SHARDED_PROJ_ENV = "VLLM_OMNI_FLUX1_SHARDED_PROJ"
 
 # Small but structurally faithful FLUX config: single-stream blocks only, since
 # the sharded path is exclusive to FluxSingleTransformerBlock. attention_head_dim
@@ -65,23 +71,42 @@ def _find_free_port() -> int:
         return int(s.getsockname()[1])
 
 
+@contextmanager
+def _sharded_proj_env(sharded: bool):
+    """Scope ``VLLM_OMNI_FLUX1_SHARDED_PROJ`` and restore the prior value.
+
+    ``_tp1_baseline`` builds a model in the parent pytest process, so an
+    unscoped ``os.environ`` write would leak the flag into every later test.
+    """
+    previous = os.environ.get(_SHARDED_PROJ_ENV)
+    os.environ[_SHARDED_PROJ_ENV] = "1" if sharded else "0"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(_SHARDED_PROJ_ENV, None)
+        else:
+            os.environ[_SHARDED_PROJ_ENV] = previous
+
+
 def _build_model(tp_size: int, *, sharded: bool, device: torch.device):
     """Build a FLUX transformer with the sharded path enabled/disabled.
 
-    The env var is set inside the worker process because the sharded branch is
-    resolved at ``FluxSingleTransformerBlock.__init__`` time.
+    The env var only has to be set while the module tree is constructed, because
+    the sharded branch is resolved at ``FluxSingleTransformerBlock.__init__`` time.
     """
-    from types import SimpleNamespace
-
     from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
 
-    os.environ["VLLM_OMNI_FLUX1_SHARDED_PROJ"] = "1" if sharded else "0"
-    od_config = SimpleNamespace(
-        tf_model_config=SimpleNamespace(num_layers=_MODEL_KWARGS["num_layers"]),
+    # Real OmniDiffusionConfig/TransformerConfig, not a duck-typed stand-in:
+    # TransformerConfig resolves num_layers through its ``params`` dict, which is
+    # the attribute path FluxTransformer2DModel.__init__ actually takes.
+    od_config = OmniDiffusionConfig(
+        tf_model_config=TransformerConfig(params={"num_layers": _MODEL_KWARGS["num_layers"]}),
         parallel_config=DiffusionParallelConfig(tensor_parallel_size=tp_size),
     )
     torch.manual_seed(_MODEL_SEED)
-    model = FluxTransformer2DModel(od_config=od_config, **_MODEL_KWARGS)
+    with _sharded_proj_env(sharded):
+        model = FluxTransformer2DModel(od_config=od_config, **_MODEL_KWARGS)
     return model.to(device=device).eval()
 
 

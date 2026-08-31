@@ -1,12 +1,12 @@
 # Tensor Parallelism Guide
 
-
 ## Table of Content
 
 - [Overview](#overview)
 - [Quick Start](#quick-start)
 - [Example Script](#example-script)
 - [Configuration Parameters](#configuration-parameters)
+- [Model-Specific Options](#model-specific-options)
 - [Best Practices](#best-practices)
 - [Troubleshooting](#troubleshooting)
 - [Summary](#summary)
@@ -30,7 +30,6 @@ See supported models list in [Supported Models](../../diffusion_features.md#supp
 ---
 
 ## Quick Start
-
 
 ### Basic Usage
 
@@ -94,10 +93,54 @@ vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8091 \
 
 In `DiffusionParallelConfig`:
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `tensor_parallel_size` | int | 1 | Number of GPUs to shard model weights across. Must divide number of heads. |
+| Parameter              | Type | Default | Description                                                                |
+| ---------------------- | ---- | ------- | -------------------------------------------------------------------------- |
+| `tensor_parallel_size` | int  | 1       | Number of GPUs to shard model weights across. Must divide number of heads. |
 
+---
+
+## Model-Specific Options
+
+### FLUX.1: sharded single-stream projections
+
+FLUX.1 has 38 single-stream blocks (`FluxSingleTransformerBlock`). By default their
+`proj_mlp` and `proj_out` layers are **replicated** on every TP rank: each rank all-gathers
+the attention output and runs the full projection GEMMs. Setting
+`VLLM_OMNI_FLUX1_SHARDED_PROJ` shards those two layers instead, so each rank holds only
+its slice and the pair costs a single all-reduce:
+
+```bash
+VLLM_OMNI_FLUX1_SHARDED_PROJ=1 \
+    vllm serve black-forest-labs/FLUX.1-dev --omni --port 8091 \
+    --tensor-parallel-size 2
+```
+
+| Value | Effect |
+| ------- | -------- |
+| unset (default) | Replicated `proj_mlp`/`proj_out`. |
+| `1`, `true`, `yes`, `on` | Sharded `proj_mlp`/`proj_out` when `tensor_parallel_size > 1`. |
+| anything else | Replicated (same as unset). |
+
+Notes:
+
+- The flag is read when the block is constructed, so it must be set before the engine
+  starts. It has no effect at `tensor_parallel_size=1`.
+- Because the reduction order changes, output is **not bit-identical** to the replicated
+  path. The composition is unchanged and the drift is confined to high-frequency detail,
+  but do not expect byte-equal images across the flag. Each setting is reproducible on
+  its own for a fixed seed.
+- Measured on FLUX.1-dev, `tensor_parallel_size=2`, 28 steps, 1024x1024, BF16 (mean of 3
+  runs): denoise step latency 1123 ms -> 1005 ms (-10.5%) and peak memory 26.8 GB ->
+  23.7 GB (-11.6%). The gain scales with how much of the step the single-stream blocks
+  occupy, so it varies by resolution, step count, and TP degree.
+- It is opt-in because the sharded path uses its own checkpoint split loader, which has
+  been validated on unquantized checkpoints and on per-tensor/per-channel FP8 scales.
+  Layouts it knows it cannot split — a parameter missing on the split projections, or
+  GPTQ/AWQ act-order group indices — raise an error naming this variable, and the
+  replicated path remains the fallback. Other quantization layouts are untested; verify
+  output quality before enabling the flag on one.
+- The double-stream blocks (`FluxTransformerBlock`) are always TP-sharded and are not
+  affected by this flag.
 
 ---
 
@@ -115,7 +158,6 @@ In `DiffusionParallelConfig`:
 - When maximum throughput is needed and memory is sufficient
 - Models with incompatible dimensions (e.g., Z-Image `num_heads=30`, which now supports `tensor_parallel_size=2`)
 
-
 ## Troubleshooting
 
 ### Common Issue 1: Out of Memory (OOM)
@@ -123,6 +165,7 @@ In `DiffusionParallelConfig`:
 **Symptoms**: CUDA OOM errors during model loading or inference, process crashes with memory errors
 
 **Solution**:
+
 ```python
 # Step 1: Enable TP with smallest degree
 parallel_config=DiffusionParallelConfig(tensor_parallel_size=2)
@@ -137,10 +180,10 @@ parallel_config=DiffusionParallelConfig(tensor_parallel_size=4)
 **Symptoms**: Error like "Model dimension X not divisible by tensor_parallel_size Y"
 
 **Solutions**:
+
 1. Check model-specific constraints (e.g., Z-Image only supports TP=2)
 2. Use a smaller TP size that divides model dimensions
 3. Consult [Supported Models](../../diffusion_features.md#supported-models) for compatible TP sizes
-
 
 ---
 

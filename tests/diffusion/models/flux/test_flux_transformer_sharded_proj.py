@@ -1,13 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-from types import SimpleNamespace
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 import torch
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.parameter import (
+    ChannelQuantScaleParameter,
+    ModelWeightParameter,
+    PerTensorScaleParameter,
+    RowvLLMParameter,
+)
 
-from vllm_omni.diffusion.data import DiffusionParallelConfig
+from vllm_omni.diffusion.data import (
+    DiffusionParallelConfig,
+    OmniDiffusionConfig,
+    TransformerConfig,
+)
 from vllm_omni.diffusion.models.flux.flux_transformer import (
     ColumnParallelApproxGELU,
     FluxSingleBlockOutput,
@@ -133,78 +141,144 @@ def test_single_transformer_block_uses_replicated_modules_when_disabled(monkeypa
     assert block.attn.output_is_parallel is False
 
 
-def test_load_split_weight_replicates_non_sharded_scale_tensor():
-    module = object.__new__(FluxSingleBlockOutput)
-    module.attn_dim = 4
-    module.mlp_dim = 8
+def _od_config(*, num_layers: int, tensor_parallel_size: int) -> OmniDiffusionConfig:
+    """Build a real ``OmniDiffusionConfig`` rather than a duck-typed stand-in.
 
-    calls = []
-
-    class Param:
-        pass
-
-    param = Param()
-
-    def _loader(p, w):
-        calls.append((p, w.clone()))
-
-    param.weight_loader = _loader
-    proj = SimpleNamespace(scale=param)
-    loaded_weight = torch.arange(6, dtype=torch.float32)
-
-    module._load_split_weight(proj, "scale", loaded_weight, logical_width=4)
-
-    assert len(calls) == 1
-    assert calls[0][0] is param
-    torch.testing.assert_close(calls[0][1], loaded_weight)
+    ``TransformerConfig`` keeps its values in a ``params`` dict behind
+    ``__getattr__``, so the real class exercises the same attribute path
+    ``FluxTransformer2DModel.__init__`` uses in production.
+    """
+    return OmniDiffusionConfig(
+        tf_model_config=TransformerConfig(params={"num_layers": num_layers}),
+        parallel_config=DiffusionParallelConfig(tensor_parallel_size=tensor_parallel_size),
+    )
 
 
-def test_load_split_weight_narrows_by_logical_width_and_start_dim():
-    module = object.__new__(FluxSingleBlockOutput)
-    module.attn_dim = 4
-    module.mlp_dim = 8
-
-    calls = []
-
-    class Param:
-        input_dim = 0
-
-    param = Param()
-
-    def _loader(p, w):
-        calls.append((p, w.clone()))
-
-    param.weight_loader = _loader
-    proj = SimpleNamespace(weight=param)
-    loaded_weight = torch.arange(24, dtype=torch.float32).reshape(12, 2)
-
-    module._load_split_weight(proj, "weight", loaded_weight, logical_width=4, start_dim=0)
-    module._load_split_weight(proj, "weight", loaded_weight, logical_width=8, start_dim=4)
-
-    assert len(calls) == 2
-    torch.testing.assert_close(calls[0][1], loaded_weight[0:4])
-    torch.testing.assert_close(calls[1][1], loaded_weight[4:12])
+def _sharded_proj_out() -> FluxSingleBlockOutput:
+    block = FluxSingleTransformerBlock(
+        dim=64,
+        num_attention_heads=2,
+        attention_head_dim=32,
+        parallel_config=DiffusionParallelConfig(tensor_parallel_size=2),
+        prefix="single_transformer_blocks.0",
+    )
+    assert block.use_sharded_single_block is True
+    assert isinstance(block.proj_out, FluxSingleBlockOutput)
+    return block.proj_out
 
 
-def test_load_split_weight_raises_for_missing_parameter():
-    module = object.__new__(FluxSingleBlockOutput)
-    module.attn_dim = 4
-    module.mlp_dim = 8
-    proj = SimpleNamespace()
+def test_load_weight_narrows_real_model_weight_parameter(monkeypatch):
+    """The fused checkpoint weight is split by logical width, honoring ``input_dim``."""
+    monkeypatch.setenv("VLLM_OMNI_FLUX1_SHARDED_PROJ", "1")
+    proj_out = _sharded_proj_out()
+    attn_dim, mlp_dim, out_dim = proj_out.attn_dim, proj_out.mlp_dim, proj_out.out_dim
+
+    # Mirror how quantized linear methods register weights: real ModelWeightParameter
+    # dispatched through the layer's own weight_loader_v2, not a hand-rolled callable.
+    for proj, width in ((proj_out.attn_proj, attn_dim), (proj_out.mlp_proj, mlp_dim)):
+        proj.register_parameter(
+            "weight",
+            ModelWeightParameter(
+                data=torch.zeros(out_dim, width, dtype=torch.float32),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=proj.weight_loader_v2,
+            ),
+        )
+
+    loaded_weight = torch.randn(out_dim, attn_dim + mlp_dim)
+    proj_out.load_weight("weight", loaded_weight)
+
+    torch.testing.assert_close(proj_out.attn_proj.weight.data, loaded_weight[:, :attn_dim])
+    torch.testing.assert_close(proj_out.mlp_proj.weight.data, loaded_weight[:, attn_dim:])
+
+
+@pytest.mark.parametrize("scale_kind", ["per_tensor", "per_channel"])
+def test_load_weight_replicates_real_quantized_scales(monkeypatch, scale_kind):
+    """FP8 scales describe output rows, which both halves share, so they replicate.
+
+    Uses vLLM's real ``PerTensorScaleParameter`` / ``ChannelQuantScaleParameter``
+    with the layer's real ``weight_loader_v2`` dispatcher: neither exposes
+    ``input_dim``, and narrowing them would trip the loader's shape assert.
+    """
+    monkeypatch.setenv("VLLM_OMNI_FLUX1_SHARDED_PROJ", "1")
+    proj_out = _sharded_proj_out()
+    out_dim = proj_out.out_dim
+
+    def _make_scale(proj):
+        if scale_kind == "per_tensor":
+            # One scale per logical output partition, as ModelOpt/AutoFP8 register it.
+            return PerTensorScaleParameter(
+                data=torch.zeros(1, dtype=torch.float32),
+                weight_loader=proj.weight_loader_v2,
+            )
+        return ChannelQuantScaleParameter(
+            data=torch.zeros(out_dim, 1, dtype=torch.float32),
+            output_dim=0,
+            weight_loader=proj.weight_loader_v2,
+        )
+
+    for proj in (proj_out.attn_proj, proj_out.mlp_proj):
+        proj.register_parameter("weight_scale", _make_scale(proj))
+
+    expected = torch.rand(1) if scale_kind == "per_tensor" else torch.rand(out_dim, 1)
+    proj_out.load_weight("weight_scale", expected)
+
+    torch.testing.assert_close(proj_out.attn_proj.weight_scale.data, expected)
+    torch.testing.assert_close(proj_out.mlp_proj.weight_scale.data, expected)
+    assert proj_out.loaded_parameter_names("weight_scale") == [
+        "attn_proj.weight_scale",
+        "mlp_proj.weight_scale",
+    ]
+
+
+@pytest.mark.parametrize("weight_name", ["g_idx", "weight_g_idx"])
+def test_load_weight_rejects_act_order_group_indices(monkeypatch, weight_name):
+    """Act-order indices must be rejected, not narrowed.
+
+    ``g_idx`` holds positions along the input dim, so narrowing it by logical width
+    rebases the positions but not the values: the mlp half would receive indices
+    offset past the end of its own scale table. That is silent corruption, so the
+    split loader raises and points at the env var instead.
+    """
+    monkeypatch.setenv("VLLM_OMNI_FLUX1_SHARDED_PROJ", "1")
+    proj_out = _sharded_proj_out()
+    total_dim = proj_out.attn_dim + proj_out.mlp_dim
+
+    # Shaped like a real act-order tensor: one group index per input column.
+    g_idx = torch.arange(total_dim, dtype=torch.int32) // 8
+    for proj in (proj_out.attn_proj, proj_out.mlp_proj):
+        proj.register_parameter(
+            weight_name,
+            RowvLLMParameter(
+                data=torch.zeros(proj.input_size_per_partition, dtype=torch.int32),
+                input_dim=0,
+                weight_loader=proj.weight_loader_v2,
+            ),
+        )
 
     with pytest.raises(ValueError, match="VLLM_OMNI_FLUX1_SHARDED_PROJ"):
-        module._load_split_weight(proj, "weight", torch.ones(4, 4), logical_width=4)
+        proj_out.load_weight(weight_name, g_idx)
+
+    # Nothing was written before the raise.
+    assert torch.all(proj_out.attn_proj.get_parameter(weight_name) == 0)
+
+
+def test_load_weight_raises_for_parameter_absent_on_split_projections(monkeypatch):
+    """A checkpoint key with no matching parameter must name the env var to unset."""
+    monkeypatch.setenv("VLLM_OMNI_FLUX1_SHARDED_PROJ", "1")
+    proj_out = _sharded_proj_out()
+
+    # "qweight" exists on quantized layers but not on these unquantized projections.
+    with pytest.raises(ValueError, match="VLLM_OMNI_FLUX1_SHARDED_PROJ"):
+        proj_out.load_weight("qweight", torch.ones(proj_out.out_dim, proj_out.attn_dim + proj_out.mlp_dim))
 
 
 def test_tp2_load_weights_splits_proj_out_weight_in_sharded_path(monkeypatch):
     monkeypatch.setenv("VLLM_OMNI_FLUX1_SHARDED_PROJ", "1")
 
-    od_config = SimpleNamespace(
-        tf_model_config=SimpleNamespace(num_layers=0),
-        parallel_config=DiffusionParallelConfig(tensor_parallel_size=2),
-    )
     model = FluxTransformer2DModel(
-        od_config=od_config,
+        od_config=_od_config(num_layers=0, tensor_parallel_size=2),
         in_channels=4,
         num_layers=0,
         num_single_layers=1,
@@ -251,43 +325,3 @@ def test_tp2_load_weights_splits_proj_out_weight_in_sharded_path(monkeypatch):
 
     torch.testing.assert_close(attn_param.detach(), expected_attn)
     torch.testing.assert_close(mlp_param.detach(), expected_mlp)
-
-
-def test_tp2_quantized_checkpoint_scale_is_replicated_for_sharded_proj_out(monkeypatch):
-    monkeypatch.setenv("VLLM_OMNI_FLUX1_SHARDED_PROJ", "1")
-
-    block = FluxSingleTransformerBlock(
-        dim=64,
-        num_attention_heads=2,
-        attention_head_dim=32,
-        parallel_config=DiffusionParallelConfig(tensor_parallel_size=2),
-        prefix="single_transformer_blocks.0",
-    )
-
-    assert block.use_sharded_single_block is True
-    proj_out = block.proj_out
-    assert isinstance(proj_out, FluxSingleBlockOutput)
-
-    calls = []
-
-    class FakeScaleParam:
-        pass
-
-    def _loader(param, loaded_weight):
-        calls.append((param, loaded_weight.clone()))
-
-    attn_scale = FakeScaleParam()
-    mlp_scale = FakeScaleParam()
-    attn_scale.weight_loader = _loader
-    mlp_scale.weight_loader = _loader
-
-    # Quantized scale tensors carry no input_dim and should be replicated.
-    setattr(proj_out.attn_proj, "weight_scale", attn_scale)
-    setattr(proj_out.mlp_proj, "weight_scale", mlp_scale)
-
-    scale_weight = torch.randn(17)
-    proj_out.load_weight("weight_scale", scale_weight)
-
-    assert len(calls) == 2
-    torch.testing.assert_close(calls[0][1], scale_weight)
-    torch.testing.assert_close(calls[1][1], scale_weight)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import os
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
@@ -16,7 +16,6 @@ from diffusers.models.embeddings import (
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.utils import is_torch_npu_available
 from vllm.distributed import (
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -52,34 +51,26 @@ logger = init_logger(__name__)
 
 _FLUX_SHARDED_PROJ_ENV = "VLLM_OMNI_FLUX1_SHARDED_PROJ"
 _FLUX_SHARDED_PROJ_ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
-_FLUX_SHARDED_PROJ_DISABLED_VALUES = frozenset({"0", "false", "no", "off", "disabled", "disable"})
+
+# Parameters whose *values* are positions along the input dimension rather than data
+# indexed by it: GPTQ/AWQ act-order group indices (``RowvLLMParameter(input_dim=0)``
+# in vLLM's auto_gptq / compressed-tensors / inc W4A16 schemes). Narrowing these by
+# logical width rebases the positions but not the values, so the mlp half would carry
+# indices offset past the end of its own scale table - silent numeric corruption
+# rather than a load error. The sharded proj_out rejects them instead of guessing.
+_POSITIONAL_INPUT_PARAMS = frozenset({"g_idx", "weight_g_idx"})
 
 
 def _should_use_flux_optimizations() -> bool:
-    """Check if FLUX sharded projection optimizations should be enabled.
+    """Return True when ``VLLM_OMNI_FLUX1_SHARDED_PROJ`` opts into sharded projections.
 
-    Sharded projections improve inference performance through efficient multi-GPU
-    execution with reduced memory footprint per GPU. Controlled via environment
-    variable VLLM_OMNI_FLUX1_SHARDED_PROJ:
-    - Not set (default): Disabled - uses standard replicated execution
-    - Set to '1', 'true', 'yes', 'on': Enable sharded projections on any device
-    - Set to '0', 'false', 'no', 'off', 'disabled', 'disable': Disable sharding
-
-    Returns:
-        bool: True if sharded projection optimization should be enabled, False otherwise
+    Sharding the single-stream ``proj_mlp``/``proj_out`` weights across TP ranks cuts
+    per-rank memory and DiT latency, but it is off by default so the replicated path
+    stays the fallback for checkpoints the split loader cannot handle. Recognized
+    enabling values are ``1``, ``true``, ``yes`` and ``on``; anything else (including
+    unset) keeps the replicated path.
     """
-    env_value = os.environ.get(_FLUX_SHARDED_PROJ_ENV, "").lower()
-
-    if not env_value:
-        return False
-
-    if env_value in _FLUX_SHARDED_PROJ_DISABLED_VALUES:
-        return False
-
-    if env_value in _FLUX_SHARDED_PROJ_ENABLED_VALUES:
-        return True
-
-    return False
+    return os.environ.get(_FLUX_SHARDED_PROJ_ENV, "").lower() in _FLUX_SHARDED_PROJ_ENABLED_VALUES
 
 
 def _get_tensor_parallel_size(parallel_config: DiffusionParallelConfig | None) -> int:
@@ -95,7 +86,14 @@ def _use_sharded_single_block_path(parallel_config: DiffusionParallelConfig | No
 
 
 def _apply_row_parallel_local(layer: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
-    bias = layer.bias if get_tensor_model_parallel_rank() == 0 else None
+    """Run a ``RowParallelLinear`` GEMM without its trailing all-reduce.
+
+    Mirrors ``RowParallelLinear.forward``'s bias handling - the (unsharded) bias is
+    fused into the rank-0 GEMM only, so a later all-reduce adds it exactly once.
+    Uses the layer's cached ``tp_rank`` rather than the global getter so ``disable_tp``
+    layers behave correctly and ``torch.compile`` sees a plain attribute read.
+    """
+    bias = layer.bias if layer.tp_rank == 0 else None
     return layer.quant_method.apply(layer, x, bias)
 
 
@@ -177,10 +175,12 @@ class FluxSingleBlockOutput(nn.Module):
         )
 
     def forward(self, attn_hidden_states: torch.Tensor, mlp_hidden_states: torch.Tensor) -> torch.Tensor:
+        # Sum the two partial projections locally so the pair costs one all-reduce
+        # instead of the two a plain RowParallelLinear pair would issue.
         attn_output = _apply_row_parallel_local(self.attn_proj, attn_hidden_states)
         mlp_output = _apply_row_parallel_local(self.mlp_proj, mlp_hidden_states)
         hidden_states = attn_output + mlp_output
-        if get_tensor_model_parallel_world_size() > 1:
+        if self.attn_proj.tp_size > 1:
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         return hidden_states
 
@@ -190,6 +190,16 @@ class FluxSingleBlockOutput(nn.Module):
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
             return
+
+        # Checked before either half is written so a rejected checkpoint leaves no
+        # partially-loaded state behind.
+        if weight_name in _POSITIONAL_INPUT_PARAMS:
+            raise ValueError(
+                f"Cannot split '{weight_name}' for the sharded FLUX proj_out: it holds "
+                f"indices into the input dimension, so narrowing it rebases the positions "
+                f"but not the values, and the mlp half would index out of range. Unset "
+                f"{_FLUX_SHARDED_PROJ_ENV} to load this checkpoint with replicated projections."
+            )
 
         self._load_split_weight(self.attn_proj, weight_name, loaded_weight, self.attn_dim)
         self._load_split_weight(self.mlp_proj, weight_name, loaded_weight, self.mlp_dim, start_dim=self.attn_dim)
@@ -214,14 +224,16 @@ class FluxSingleBlockOutput(nn.Module):
 
         weight_loader = getattr(param, "weight_loader", default_weight_loader)
 
-        # Per-tensor / per-output-channel quantization scales carry no input_dim and are
-        # not split across the attn/mlp halves - they must be replicated verbatim.
-        # Narrowing them (the old unconditional path) yielded shard_size == 0.
-        if not hasattr(param, "input_dim"):
+        # Per-tensor and per-output-channel quantization scales (PerTensorScaleParameter,
+        # ChannelQuantScaleParameter) expose no input_dim: they describe the *output*
+        # rows, which both halves share, so they are replicated verbatim.
+        # `is None` mirrors RowParallelLinear.weight_loader, which also tolerates an
+        # explicitly-None input_dim attribute.
+        split_dim = getattr(param, "input_dim", None)
+        if split_dim is None:
             weight_loader(param, loaded_weight)
             return
 
-        split_dim = param.input_dim
         total_width = self.attn_dim + self.mlp_dim
         dim_size = loaded_weight.shape[split_dim]
         start_idx = dim_size * start_dim // total_width
@@ -256,12 +268,7 @@ class FeedForward(nn.Module):
 
         layers: list[nn.Module] = [
             ColumnParallelApproxGELU(
-                dim,
-                inner_dim,
-                approximate="tanh",
-                bias=bias,
-                quant_config=quant_config,
-                prefix=f"{prefix}.net.0",
+                dim, inner_dim, approximate="tanh", bias=bias, quant_config=quant_config, prefix=f"{prefix}.net.0"
             ),
             nn.Identity(),  # placeholder for weight loading
             RowParallelLinear(
@@ -383,11 +390,9 @@ class FluxAttention(torch.nn.Module):
         attention_mask: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        precomputed_qkv: torch.Tensor | None = kwargs.get("precomputed_qkv")
-        if precomputed_qkv is None:
-            qkv, _ = self.to_qkv(hidden_states.contiguous())
-        else:
-            qkv = precomputed_qkv
+        # Ensure contiguous for FP8 quantized linear layers
+        hidden_states = hidden_states.contiguous()
+        qkv, _ = self.to_qkv(hidden_states)
         q_size = self.to_qkv.num_heads * self.head_dim
         kv_size = self.to_qkv.num_kv_heads * self.head_dim
         query, key, value = qkv.split([q_size, kv_size, kv_size], dim=-1)
@@ -434,20 +439,17 @@ class FluxAttention(torch.nn.Module):
             attn_metadata,
         )
         hidden_states = hidden_states.flatten(2, 3)
-        if hidden_states.dtype != query.dtype:
-            hidden_states = hidden_states.to(query.dtype)
+        hidden_states = hidden_states.to(query.dtype)
 
         if encoder_hidden_states is not None:
-            encoder_seq_len = encoder_hidden_states.shape[1]
-            encoder_hidden_states, hidden_states = hidden_states.split(
-                [encoder_seq_len, hidden_states.shape[1] - encoder_seq_len],
-                dim=1,
+            encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
+                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
             )
             # Contiguous for FP8 quantization in RowParallelLinear: the dim=1 split above
             # yields a non-contiguous view for batch > 1, which corrupts FP8 numerics.
             hidden_states = self.to_out[0](hidden_states.contiguous())
-            encoder_hidden_states = self.to_add_out(encoder_hidden_states.contiguous())
             hidden_states = self.to_out[1](hidden_states)
+            encoder_hidden_states = self.to_add_out(encoder_hidden_states.contiguous())
 
             return hidden_states, encoder_hidden_states
         else:
@@ -469,11 +471,7 @@ class FluxTransformerBlock(nn.Module):
     ):
         super().__init__()
         self.norm1 = AdaLayerNormZero(dim, quant_config=quant_config, prefix=f"{prefix}.norm1")
-        self.norm1_context = AdaLayerNormZero(
-            dim,
-            quant_config=quant_config,
-            prefix=f"{prefix}.norm1_context",
-        )
+        self.norm1_context = AdaLayerNormZero(dim, quant_config=quant_config, prefix=f"{prefix}.norm1_context")
 
         self.attn = FluxAttention(
             query_dim=dim,
@@ -492,12 +490,7 @@ class FluxTransformerBlock(nn.Module):
         self.ff = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix=f"{prefix}.ff")
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.ff_context = FeedForward(
-            dim=dim,
-            dim_out=dim,
-            quant_config=quant_config,
-            prefix=f"{prefix}.ff_context",
-        )
+        self.ff_context = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config, prefix=f"{prefix}.ff_context")
 
     def forward(
         self,
@@ -514,6 +507,7 @@ class FluxTransformerBlock(nn.Module):
         )
         joint_attention_kwargs = joint_attention_kwargs or {}
 
+        # Attention.
         attention_outputs = self.attn(
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
@@ -526,6 +520,7 @@ class FluxTransformerBlock(nn.Module):
         elif len(attention_outputs) == 3:
             attn_output, context_attn_output, ip_attn_output = attention_outputs
 
+        # Process attention outputs for the `hidden_states`.
         attn_output = gate_msa.unsqueeze(1) * attn_output
         hidden_states = hidden_states + attn_output
 
@@ -539,6 +534,7 @@ class FluxTransformerBlock(nn.Module):
         if len(attention_outputs) == 3:
             hidden_states = hidden_states + ip_attn_output
 
+        # Process attention outputs for the `encoder_hidden_states`.
         context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
         encoder_hidden_states = encoder_hidden_states + context_attn_output
 
@@ -569,11 +565,7 @@ class FluxSingleTransformerBlock(nn.Module):
         self.mlp_hidden_dim = int(dim * mlp_ratio)
         self.use_sharded_single_block = _use_sharded_single_block_path(parallel_config)
 
-        self.norm = AdaLayerNormZeroSingle(
-            dim,
-            quant_config=safe_quant_config(quant_config),
-            prefix=f"{prefix}.norm",
-        )
+        self.norm = AdaLayerNormZeroSingle(dim, quant_config=safe_quant_config(quant_config), prefix=f"{prefix}.norm")
         if self.use_sharded_single_block:
             self.proj_mlp = ColumnParallelApproxGELU(
                 dim,
@@ -636,15 +628,21 @@ class FluxSingleTransformerBlock(nn.Module):
 
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-        qkv, mlp_hidden_states = self.to_qkv_mlp_proj(norm_hidden_states)
+        if self.use_sharded_single_block:
+            # ColumnParallelApproxGELU already applies the tanh GELU.
+            mlp_hidden_states = self.proj_mlp(norm_hidden_states)
+        else:
+            mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
             image_rotary_emb=image_rotary_emb,
-            precomputed_qkv=qkv,
             **joint_attention_kwargs,
         )
+
         if self.use_sharded_single_block:
+            # attn_output and mlp_hidden_states stay TP-sharded on the feature dim;
+            # FluxSingleBlockOutput projects each half and all-reduces once.
             hidden_states = gate.unsqueeze(1) * self.proj_out(attn_output, mlp_hidden_states)
         else:
             hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
@@ -656,15 +654,6 @@ class FluxSingleTransformerBlock(nn.Module):
         encoder_hidden_states, hidden_states = hidden_states[:, :text_seq_len], hidden_states[:, text_seq_len:]
         return encoder_hidden_states, hidden_states
 
-    def to_qkv_mlp_proj(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # Project single-stream inputs for QKV and MLP in one path.
-        qkv, _ = self.attn.to_qkv(hidden_states)
-        if self.use_sharded_single_block:
-            mlp_hidden_states = self.proj_mlp(hidden_states)
-        else:
-            mlp_hidden_states = self.act_mlp(self.proj_mlp(hidden_states))
-        return qkv, mlp_hidden_states
-
 
 class FluxPosEmbed(nn.Module):
     # modified from https://github.com/black-forest-labs/flux/blob/c00d7c60b085fce8058b9df845e036090873f2ce/src/flux/modules/layers.py#L11
@@ -673,7 +662,7 @@ class FluxPosEmbed(nn.Module):
         self.theta = theta
         self.axes_dim = axes_dim
 
-    def forward(self, ids: torch.Tensor, target_dtype: torch.dtype | None = None) -> torch.Tensor:
+    def forward(self, ids: torch.Tensor, target_dtype: torch.dtype | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         n_axes = ids.shape[-1]
         cos_out = []
         sin_out = []
