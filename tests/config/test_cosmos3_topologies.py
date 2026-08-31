@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 topology registration, deploy YAMLs and per-stage device mapping.
 
 Cosmos3 ships two topologies over the *same* checkpoint: the co-located

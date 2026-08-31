@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Pipeline registry and factory for vllm-omni.
 
 ``OMNI_PIPELINES`` maps each ``model_type`` to either a ``PipelineConfig``

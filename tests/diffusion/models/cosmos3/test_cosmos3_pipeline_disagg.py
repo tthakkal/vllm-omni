@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for the tower-split Cosmos3 pipelines (reasoner / generator).
 
 Both towers are stubbed: what is under test is the split itself -- which tower
@@ -117,7 +117,7 @@ def _mask(real_len: int, total_len: int) -> torch.Tensor:
 
 
 def _sampling_params(**overrides: Any) -> SimpleNamespace:
-    values = {
+    values: dict[str, Any] = {
         "height": None,
         "width": None,
         "guidance_scale": None,
@@ -527,7 +527,7 @@ class TestGeneratorPipeline:
 
     def test_extracts_the_payload_from_sampling_params(self):
         """Fallback that mirrors GLM-Image's DiT stage; handy for direct driving."""
-        payload = {KV_KEY: {"fp": []}}
+        payload: dict[str, Any] = {KV_KEY: {"fp": []}}
         req = SimpleNamespace(prompts=[{"prompt": "x"}], sampling_params=SimpleNamespace(extra_args=payload))
 
         assert Cosmos3GeneratorPipeline._extract_und_payload(req) is payload

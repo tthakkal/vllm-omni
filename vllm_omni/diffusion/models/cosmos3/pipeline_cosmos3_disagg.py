@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tower-split Cosmos3 pipelines: reasoner (UND) and generator (GEN) stages.
 
 Both classes subclass ``Cosmos3OmniDiffusersPipeline`` so prompt formatting,

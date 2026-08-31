@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage-input processor for the Cosmos3 reasoner -> generator handoff.
 
 The Cosmos3 analogue of ``glm_image.ar2diffusion``: it turns stage 0's output

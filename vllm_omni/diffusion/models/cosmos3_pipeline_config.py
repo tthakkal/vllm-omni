@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Cosmos3 topologies: co-located (one stage) and disaggregated (one per tower).
 
 Cosmos3 is an Omni-modal foundation model built on a Mixture-of-Transformers
