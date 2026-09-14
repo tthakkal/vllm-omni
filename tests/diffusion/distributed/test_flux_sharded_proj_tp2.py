@@ -32,6 +32,8 @@ import torch
 
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionSpec,
     DiffusionParallelConfig,
     OmniDiffusionConfig,
     TransformerConfig,
@@ -95,17 +97,26 @@ def _build_model(tp_size: int, *, sharded: bool, device: torch.device):
     The env var only has to be set while the module tree is constructed, because
     the sharded branch is resolved at ``FluxSingleTransformerBlock.__init__`` time.
     """
+    from vllm_omni.diffusion.config import set_current_diffusion_config
     from vllm_omni.diffusion.models.flux.flux_transformer import FluxTransformer2DModel
 
     # Real OmniDiffusionConfig/TransformerConfig, not a duck-typed stand-in:
     # TransformerConfig resolves num_layers through its ``params`` dict, which is
     # the attribute path FluxTransformer2DModel.__init__ actually takes.
+    #
+    # TORCH_SDPA is pinned rather than left to the platform default: these checks
+    # compare fp32 tensors on CPU and on accelerators, and the FlashAttention
+    # backends have no CPU kernel and reject fp32 on device, so the platform
+    # default would decide the test's outcome instead of the sharded proj path.
     od_config = OmniDiffusionConfig(
         tf_model_config=TransformerConfig(params={"num_layers": _MODEL_KWARGS["num_layers"]}),
         parallel_config=DiffusionParallelConfig(tensor_parallel_size=tp_size),
+        diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA")),
     )
     torch.manual_seed(_MODEL_SEED)
-    with _sharded_proj_env(sharded):
+    # Attention layers read the backend off the *global* diffusion config, not the
+    # od_config handed to the model, so construction has to run inside this scope.
+    with _sharded_proj_env(sharded), set_current_diffusion_config(od_config):
         model = FluxTransformer2DModel(od_config=od_config, **_MODEL_KWARGS)
     return model.to(device=device).eval()
 

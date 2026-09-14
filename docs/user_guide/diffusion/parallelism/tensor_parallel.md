@@ -93,9 +93,9 @@ vllm serve Tongyi-MAI/Z-Image-Turbo --omni --port 8091 \
 
 In `DiffusionParallelConfig`:
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `tensor_parallel_size` | int | 1 | Number of GPUs to shard model weights across. Must divide number of heads. |
+| Parameter              | Type | Default | Description                                                                |
+|------------------------|------|---------|----------------------------------------------------------------------------|
+| `tensor_parallel_size` | int  | 1       | Number of GPUs to shard model weights across. Must divide number of heads. |
 
 ---
 

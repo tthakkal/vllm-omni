@@ -85,18 +85,6 @@ def _use_sharded_single_block_path(parallel_config: DiffusionParallelConfig | No
     return _get_tensor_parallel_size(parallel_config) > 1
 
 
-def _apply_row_parallel_local(layer: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
-    """Run a ``RowParallelLinear`` GEMM without its trailing all-reduce.
-
-    Mirrors ``RowParallelLinear.forward``'s bias handling - the (unsharded) bias is
-    fused into the rank-0 GEMM only, so a later all-reduce adds it exactly once.
-    Uses the layer's cached ``tp_rank`` rather than the global getter so ``disable_tp``
-    layers behave correctly and ``torch.compile`` sees a plain attribute read.
-    """
-    bias = layer.bias if layer.tp_rank == 0 else None
-    return layer.quant_method.apply(layer, x, bias)
-
-
 def _compute_image_rotary_emb(
     pos_embed: "FluxPosEmbed",
     txt_ids: torch.Tensor,
@@ -155,12 +143,17 @@ class FluxSingleBlockOutput(nn.Module):
         self.attn_dim = attn_dim
         self.mlp_dim = mlp_dim
         self.out_dim = out_dim
+        # ``reduce_results=False`` on both halves so the pair costs one all-reduce
+        # instead of the two a plain RowParallelLinear pair would issue. The bias is
+        # not sharded, so it must not be folded into a partial sum: ``skip_bias_add``
+        # hands it back for ``forward`` to add once, after the reduction.
         self.attn_proj = RowParallelLinear(
             attn_dim,
             out_dim,
             bias=bias,
             input_is_parallel=True,
-            return_bias=False,
+            skip_bias_add=True,
+            reduce_results=False,
             quant_config=quant_config,
             prefix=f"{prefix}.attn_proj",
         )
@@ -169,19 +162,21 @@ class FluxSingleBlockOutput(nn.Module):
             out_dim,
             bias=False,
             input_is_parallel=True,
+            reduce_results=False,
             return_bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp_proj",
         )
 
     def forward(self, attn_hidden_states: torch.Tensor, mlp_hidden_states: torch.Tensor) -> torch.Tensor:
-        # Sum the two partial projections locally so the pair costs one all-reduce
-        # instead of the two a plain RowParallelLinear pair would issue.
-        attn_output = _apply_row_parallel_local(self.attn_proj, attn_hidden_states)
-        mlp_output = _apply_row_parallel_local(self.mlp_proj, mlp_hidden_states)
+        attn_output, attn_bias = self.attn_proj(attn_hidden_states)
+        mlp_output = self.mlp_proj(mlp_hidden_states)
         hidden_states = attn_output + mlp_output
+        # ``tp_size`` rather than the global getter so a ``disable_tp`` layer is right.
         if self.attn_proj.tp_size > 1:
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        if attn_bias is not None:
+            hidden_states = hidden_states + attn_bias
         return hidden_states
 
     def load_weight(self, weight_name: str, loaded_weight: torch.Tensor) -> None:
