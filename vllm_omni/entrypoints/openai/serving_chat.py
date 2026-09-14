@@ -34,7 +34,11 @@ from vllm_omni.entrypoints.openai.diffusion_request_utils import (
     apply_normalized_diffusion_request_extra_args,
     normalize_diffusion_request_args,
 )
-from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
+from vllm_omni.entrypoints.openai.protocol.chat_completion import (
+    OmniChatCompletionResponse,
+    OmniChatCompletionResponseChoice,
+    OmniChatCompletionResponseStreamChoice,
+)
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.metrics import definitions as _metric_defs
@@ -2860,18 +2864,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         for output in final_res.outputs:
             if stream:
-                choice_data = ChatCompletionResponseStreamChoice(
+                choice_data = OmniChatCompletionResponseStreamChoice(
                     index=output.index,
                     delta=DeltaMessage(role=role, content=audio_base64),
+                    audio_metadata=audio_response.audio_metadata,
                     logprobs=None,
                     finish_reason=output.finish_reason,
                     stop_reason=output.stop_reason,
                     token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
                 )
             else:
-                choice_data = ChatCompletionResponseChoice(
+                choice_data = OmniChatCompletionResponseChoice(
                     index=output.index,
                     message=ChatMessage(role=role, audio=audio_obj),
+                    audio_metadata=audio_response.audio_metadata,
                     logprobs=None,
                     finish_reason="stop",
                     stop_reason=output.stop_reason,
@@ -3080,11 +3086,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             ar_image_size: str | None = None
             if height is not None and width is not None:
                 ar_image_size = f"{width}x{height}"
+            # Reuse build_kwargs's own (possibly-omitted) "bot_task" entry rather
+            # than the raw outer `bot_task` variable: build_prompt_tokens/build_prompt
+            # above default an omitted bot_task per-task (e.g. "think" for t2i), and
+            # resolve_stop_token_ids must normalize from that same omitted-or-not
+            # starting point to agree on which stop tokens apply -- passing the raw
+            # `bot_task` (still None when omitted) made the two calls disagree.
+            ar_stop_kwargs: dict[str, Any] = {}
+            if "bot_task" in build_kwargs:
+                ar_stop_kwargs["bot_task"] = build_kwargs["bot_task"]
             ar_stop_token_ids = resolve_stop_token_ids(
                 task=ar_task,
-                bot_task=bot_task,
                 tokenizer=tokenizer,
                 image_size=ar_image_size,
+                **ar_stop_kwargs,
             )
 
         engine_prompt: OmniTextPrompt = {"prompt": prompt}
