@@ -87,7 +87,7 @@ th {
 | `Qwen3TTSForConditionalGeneration` | Qwen3-TTS-12Hz-1.7B-Base | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `MingTTSForConditionalGeneration` | Ming-omni-tts dense 0.5B | `inclusionAI/Ming-omni-tts-0.5B` | ✅︎ | | | ✅︎ | — |
 | `GLMTTSForConditionalGeneration` | GLM-TTS | `zai-org/GLM-TTS` | ✅︎ | | | | — |
-| `MossTTSNanoForCausalLM` | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✅︎ | | | | — |
+| `MossTTSNanoForCausalLM` | MOSS-TTS-Nano | `OpenMOSS-Team/MOSS-TTS-Nano` | ✅︎ | | ✅︎ | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/OpenMOSS/MOSS-TTS-Nano-NPU.md) |
 | `MossTTSDelayModel` | MOSS-TTS, MOSS-TTSD, MOSS-SoundEffect, MOSS-VoiceGenerator | `OpenMOSS-Team/MOSS-VoiceGenerator` | ✅︎ | | | | — |
 | `MossTTSRealtime` | MOSS-TTS-Realtime | `OpenMOSS-Team/MOSS-TTS-Realtime` | ✅︎ | | | | — |
 | `HiggsAudioV2ForConditionalGeneration` | Higgs-Audio v2 | `bosonai/higgs-audio-v2-generation-3B-base` | ✅︎ | | | | — |
@@ -107,7 +107,7 @@ th {
 | `VoxtralTTSForConditionalGeneration` | Voxtral TTS | `mistralai/Voxtral-4B-TTS-2603` | ✅︎ | ✅︎ | | | — |
 | `CovoAudioForConditionalGeneration` | Covo-Audio-Chat | `tencent/Covo-Audio-Chat` | ✅︎ | | | | — |
 | `DyninOmniForConditionalGeneration` | Dynin-Omni | `snu-aidas/Dynin-Omni` | ✅︎ | | | ✅︎ | — |
-| `MiniCPMO45OmniForConditionalGeneration` | MiniCPM-o 4.5 | `openbmb/MiniCPM-o-4_5` | ✅︎ | | ✅︎ | | — |
+| `MiniCPMO45OmniForConditionalGeneration` | MiniCPM-o 4.5 | `openbmb/MiniCPM-o-4_5` | ✅︎ | | ✅︎ | | [Repository](https://github.com/vllm-project/vllm-omni/blob/main/recipes/OpenBMB/MiniCPM-o-4_5.md) |
 | `ErnieImagePipeline` | ERNIE-Image | `baidu/ERNIE-Image`, `baidu/ERNIE-Image-Turbo` | ✅︎ | ✅︎ | ✅︎ | ✅︎ | — |
 | `GepardTalkerForConditionalGeneration` | Gepard-1.0 | `nineninesix/gepard-1.0` | ✅︎ | | | ✅︎ | — |
 | `HiDreamImagePipeline` | HiDream-I1-Full | `HiDream-ai/HiDream-I1-Full` | ✅︎ | ✅︎ | | | — |
