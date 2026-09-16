@@ -37,6 +37,12 @@ def _init_distributed():
     branch but no collective, per-rank shard or all-reduce actually runs.
     Real two-rank forward/load parity lives in
     ``tests/diffusion/distributed/test_flux_sharded_proj_tp2.py``.
+
+    ``backend="gloo"``: these are CPU tests, but
+    ``init_distributed_environment`` defaults to ``"nccl"`` - on a GPU runner that
+    initializes NCCL and claims a device, and on a CPU-only runner it only works
+    by way of vLLM's fallback-to-gloo warning path. Asking for gloo directly makes
+    the fixture behave the same either way.
     """
     from vllm.distributed.parallel_state import (
         cleanup_dist_env_and_memory,
@@ -49,8 +55,9 @@ def _init_distributed():
         rank=0,
         local_rank=0,
         distributed_init_method="tcp://127.0.0.1:29513",
+        backend="gloo",
     )
-    initialize_model_parallel()
+    initialize_model_parallel(backend="gloo")
     yield
     cleanup_dist_env_and_memory()
 
@@ -139,6 +146,58 @@ def test_single_transformer_block_uses_replicated_modules_when_disabled(monkeypa
     assert isinstance(block.proj_out, ReplicatedLinear)
     assert hasattr(block, "act_mlp")
     assert block.attn.output_is_parallel is False
+
+
+def _single_block(monkeypatch, *, sharded: bool) -> FluxSingleTransformerBlock:
+    monkeypatch.setenv("VLLM_OMNI_FLUX1_SHARDED_PROJ", "1" if sharded else "0")
+    return FluxSingleTransformerBlock(
+        dim=64,
+        num_attention_heads=2,
+        attention_head_dim=32,
+        parallel_config=DiffusionParallelConfig(tensor_parallel_size=2),
+        prefix="single_transformer_blocks.0",
+    )
+
+
+def test_sharded_projections_keep_the_checkpoint_quant_prefix(monkeypatch):
+    """Both branches must hand quant configs the same layer names.
+
+    ``prefix`` is what ``ignored_layers``/``modules_to_not_convert`` and per-layer
+    scheme lookups match against, and those lists name the checkpoint's
+    ``proj_out``/``proj_mlp``. If the sharded halves reported
+    ``proj_out.attn_proj`` or ``proj_mlp.proj`` instead, a layer the checkpoint
+    asked to leave alone would get quantized.
+    """
+    sharded = _single_block(monkeypatch, sharded=True)
+    replicated = _single_block(monkeypatch, sharded=False)
+
+    assert replicated.proj_out.prefix == "single_transformer_blocks.0.proj_out"
+    assert sharded.proj_out.attn_proj.prefix == replicated.proj_out.prefix
+    assert sharded.proj_out.mlp_proj.prefix == replicated.proj_out.prefix
+
+    assert replicated.proj_mlp.prefix == "single_transformer_blocks.0.proj_mlp"
+    assert sharded.proj_mlp.proj.prefix == replicated.proj_mlp.prefix
+
+
+@pytest.mark.parametrize(
+    "ignored_layers",
+    [
+        # Exactly as an FP8/MXFP8 checkpoint lists them: the fully-qualified name, or
+        # the bare module name shared by every block.
+        ["single_transformer_blocks.0.proj_out", "single_transformer_blocks.0.proj_mlp"],
+        ["proj_out", "proj_mlp"],
+    ],
+)
+def test_sharded_projections_are_skipped_by_ignored_layers(monkeypatch, ignored_layers):
+    """vLLM's own skip matcher must still recognize the sharded halves."""
+    from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+
+    block = _single_block(monkeypatch, sharded=True)
+
+    for layer in (block.proj_out.attn_proj, block.proj_out.mlp_proj, block.proj_mlp.proj):
+        assert is_layer_skipped(layer.prefix, ignored_layers, match_mode="suffix"), (
+            f"{layer.prefix!r} escaped ignored_layers={ignored_layers}"
+        )
 
 
 def _od_config(*, num_layers: int, tensor_parallel_size: int) -> OmniDiffusionConfig:

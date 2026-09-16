@@ -110,7 +110,16 @@ class ColumnParallelApproxGELU(nn.Module):
         bias: bool = True,
         quant_config: "QuantizationConfig | None" = None,
         prefix: str = "",
+        linear_prefix: str | None = None,
     ):
+        """``linear_prefix`` overrides the wrapped linear's quantization prefix.
+
+        Diffusers' ``FeedForward`` keeps these weights under ``{prefix}.proj``, so
+        that is the default. FLUX's single-block ``proj_mlp`` instead keeps them
+        directly under ``{prefix}``, and the quant prefix is what
+        ``ignored_layers``/``modules_to_not_convert`` match against, so that caller
+        passes its own name to stay matchable.
+        """
         super().__init__()
         self.proj = ColumnParallelLinear(
             dim_in,
@@ -119,7 +128,7 @@ class ColumnParallelApproxGELU(nn.Module):
             gather_output=False,
             return_bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.proj",
+            prefix=linear_prefix if linear_prefix is not None else f"{prefix}.proj",
         )
         self.approximate = approximate
 
@@ -143,6 +152,13 @@ class FluxSingleBlockOutput(nn.Module):
         self.attn_dim = attn_dim
         self.mlp_dim = mlp_dim
         self.out_dim = out_dim
+        # Both halves are constructed with the *checkpoint's* ``proj_out`` prefix, not
+        # ``{prefix}.attn_proj``/``{prefix}.mlp_proj``: the quant prefix is what
+        # ``ignored_layers``/``modules_to_not_convert`` and per-layer scheme lookups
+        # match against, and those lists name ``proj_out`` (the replicated layer this
+        # pair replaces). A deeper prefix would silently quantize a layer the
+        # checkpoint asked to skip.
+        #
         # ``reduce_results=False`` on both halves so the pair costs one all-reduce
         # instead of the two a plain RowParallelLinear pair would issue. The bias is
         # not sharded, so it must not be folded into a partial sum: ``skip_bias_add``
@@ -155,7 +171,7 @@ class FluxSingleBlockOutput(nn.Module):
             skip_bias_add=True,
             reduce_results=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.attn_proj",
+            prefix=prefix,
         )
         self.mlp_proj = RowParallelLinear(
             mlp_dim,
@@ -165,7 +181,7 @@ class FluxSingleBlockOutput(nn.Module):
             reduce_results=False,
             return_bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.mlp_proj",
+            prefix=prefix,
         )
 
     def forward(self, attn_hidden_states: torch.Tensor, mlp_hidden_states: torch.Tensor) -> torch.Tensor:
@@ -568,6 +584,9 @@ class FluxSingleTransformerBlock(nn.Module):
                 bias=True,
                 quant_config=quant_config,
                 prefix=f"{prefix}.proj_mlp",
+                # Quantization prefix stays the checkpoint's ``proj_mlp``, matching the
+                # replicated branch, even though the parameter lives at ``proj_mlp.proj``.
+                linear_prefix=f"{prefix}.proj_mlp",
             )
             self.proj_out = FluxSingleBlockOutput(
                 dim,
