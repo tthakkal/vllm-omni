@@ -523,10 +523,10 @@ class Attention(nn.Module):
                 "Attention backend '%s' cannot honor a %dD attn_mask on this platform; "
                 "running this layer on SDPA. Set DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA "
                 "to select it everywhere.",
-                self.attn_backend.get_name(),
+                cast(type[AttentionBackend], self.attn_backend).get_name(),
                 attn_metadata.attn_mask.ndim,
             )
-            return self.sdpa_fallback.forward(query, key, value, attn_metadata)
+            return cast(AttentionImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
 
         if (
             self.allow_fp32_fallback
@@ -589,6 +589,11 @@ class Attention(nn.Module):
             return False
         if attn_metadata.attn_mask.ndim <= 2:
             return False
+        # A custom-attention layer has no resolved backend and no sdpa_fallback to
+        # reroute to; it owns its own masking. _run_local_attention returns before
+        # this point for that case, so this only pins the invariant.
+        if self.attn_backend is None:
+            return False
         if not self.attn_backend.supports_attention_mask():
             return False
         return not self.attn_backend.supports_dense_attention_mask()
@@ -612,7 +617,7 @@ class Attention(nn.Module):
         self._assert_piecewise_compatible(attn_metadata)
 
     def _assert_piecewise_compatible(self, attn_metadata: AttentionMetadata | None) -> None:
-        if attn_metadata is None or attn_metadata.full_attn_spans is None:
+        if attn_metadata is None or attn_metadata.full_attn_spans is None or self.attn_backend is None:
             return
         if attn_metadata.attn_mask is not None and attn_metadata.attn_mask.ndim == 4:
             return

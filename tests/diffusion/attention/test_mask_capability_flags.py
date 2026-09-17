@@ -233,8 +233,8 @@ def test_piecewise_assert_rejects_any_non_none_spans_on_unsupported_backend(span
 
     Emptiness is not the unrestricted case: ``build_segments`` emits a single causal
     segment covering the whole sequence when it finds no spans, so ``[[]]`` asks for
-    *more* masking than ``[[(0, n)]]``, not less. ``forward_fa_quant_npu`` keys on
-    ``is None`` for the same reason.
+    *more* masking than ``[[(0, n)]]``, not less. ``forward_cuda`` keys on ``is None``
+    for the same reason.
     """
     layer = _Layer(_MaskBlind)
     metadata = AttentionMetadata(full_attn_spans=spans)

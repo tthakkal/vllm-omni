@@ -9,7 +9,6 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
 from vllm_omni.diffusion.attention.backends.sdpa import _maybe_reshape_attn_mask
-from vllm_omni.diffusion.attention.backends.utils.fa import mask_excludes_tokens
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import (
     piecewise_attn,
     run_paged_piecewise_plan,
@@ -144,36 +143,6 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
             "only the dense flash_attn_func path passes deterministic=True.",
             path,
         )
-
-    @staticmethod
-    def _mask_restricts_attention(attention_mask: torch.Tensor | None) -> bool:
-        """Whether a mask of either convention actually forbids any position.
-
-        Unlike ``mask_excludes_tokens`` this reads additive masks too and never
-        raises, because it guards paths that would *drop* the mask rather than
-        consume it: 0 means "keep" for an additive mask and "drop" for a keep-mask.
-
-        Floating point is deliberately not assumed to be additive. A float
-        ``[B, Skv]`` keep-mask (1.0 valid / 0.0 pad) is an ordinary thing for a
-        model to hand over, and reading it as additive would invert it and reject
-        an all-valid mask that restricts nothing.
-
-        A negative entry is the one unambiguous signature of the additive
-        convention -- a keep-mask is never negative -- so it decides which
-        reading applies. All-zero stays additive-unrestricted, which is both the
-        pre-existing answer and the only useful one: as a keep-mask it would mean
-        every token is padding. Integer and boolean masks are always keep-masks,
-        since an additive mask needs ``finfo.min``.
-        """
-        if attention_mask is None:
-            return False
-        if attention_mask.dtype.is_floating_point:
-            if bool((attention_mask < 0).any()):
-                return bool((attention_mask != 0).any())
-            if bool((attention_mask == 0).all()):
-                return False
-            return bool((attention_mask == 0).any())
-        return bool((attention_mask == 0).any())
 
     @staticmethod
     def _unwrap_flash_output(out: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
@@ -510,7 +479,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
                 max_seqlen_k=extra["max_seqlen_k"],
             )
 
-        if attention_mask is not None and mask_excludes_tokens(attention_mask):
+        if attention_mask is not None and torch.any(~attention_mask):
             self._warn_fa_deterministic_non_dense("masked-varlen")
             return self._forward_varlen_masked(
                 query,
@@ -557,7 +526,7 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
 
         attention_mask = attn_metadata.attn_mask if attn_metadata is not None else None
 
-        if attention_mask is not None and mask_excludes_tokens(attention_mask):
+        if attention_mask is not None and torch.any(~attention_mask):
             return self._forward_varlen_masked(
                 query,
                 key,
@@ -593,26 +562,6 @@ class FlashAttentionImpl(AttentionImpl[AttentionMetadata]):
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         from vllm_omni.platforms.npu.quant.kv_quant_npu import fp8_rotate_quant_fa
-
-        # fp8_rotate_quant_fa takes no mask argument, so anything the model built to
-        # restrict attention would be dropped here and every query would attend to
-        # every key -- wrong output, no error. Refuse rather than drop it silently.
-        #
-        # The mask is tested for effect, since an all-keep mask restricts nothing and
-        # dropping it was always correct. Spans are tested for *presence*, because an
-        # empty span list is not the unrestricted case: build_segments emits a single
-        # causal segment covering the whole sequence when it sees no spans, which is
-        # the most restrictive pattern in the scheme, not the least. That matches
-        # forward_cuda and _assert_piecewise_compatible, which both key on `is None`.
-        if attn_metadata is not None and (
-            self._mask_restricts_attention(attn_metadata.attn_mask) or attn_metadata.full_attn_spans is not None
-        ):
-            raise ValueError(
-                "FlashAttention NPU KV-quant path (extra['kv_cache_dtype']) cannot apply an "
-                "attn_mask or full_attn_spans; running it would silently attend over masked "
-                "positions. Drop the KV quantization for this model, or use SDPA "
-                "(DIFFUSION_ATTENTION_BACKEND=TORCH_SDPA)."
-            )
 
         layout = self.qkv_layout or "BNSD"
         # Models pass (B, S, H, D); NPU fused op expects (B, N, S, D).

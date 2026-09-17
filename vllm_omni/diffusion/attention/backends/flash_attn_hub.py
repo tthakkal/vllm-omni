@@ -14,7 +14,6 @@ from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionImpl,
     AttentionMetadata,
 )
-from vllm_omni.diffusion.attention.backends.utils.fa import mask_excludes_tokens
 from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import piecewise_attn
 from vllm_omni.platforms import current_omni_platform
 
@@ -230,7 +229,7 @@ class FlashAttentionHubImpl(AttentionImpl[AttentionMetadata]):
                 query_ranges=None if attn_metadata is None else attn_metadata.query_ranges,
             )
 
-        if attention_mask is not None and mask_excludes_tokens(attention_mask):
+        if attention_mask is not None and torch.any(~attention_mask):
             return self._forward_varlen_masked(
                 query,
                 key,
@@ -403,7 +402,7 @@ class FlashAttention3HubImpl(AttentionImpl[AttentionMetadata]):
                 query_ranges=None if attn_metadata is None else attn_metadata.query_ranges,
             )
 
-        if attention_mask is not None and mask_excludes_tokens(attention_mask):
+        if attention_mask is not None and torch.any(~attention_mask):
             return self._forward_varlen_masked(
                 query,
                 key,
