@@ -37,6 +37,7 @@ from vllm_omni.diffusion.models.cosmos3_pipeline_config import (
     COSMOS3_PIPELINE,
 )
 from vllm_omni.diffusion.models.pi0_pipeline_config import PI0_PIPELINE
+from vllm_omni.diffusion.models.pi05_pipeline_config import PI05_PIPELINE
 from vllm_omni.model_executor.models.audex.pipeline import (
     AUDEX_S2S_PIPELINE,
     AUDEX_THINKER_ONLY_PIPELINE,
@@ -157,6 +158,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "lingbot_world": LINGBOT_WORLD_PIPELINE,
     "Gr00tN1d7": GR00T_N1D7_PIPELINE,
     "pi0": PI0_PIPELINE,
+    "pi05": PI05_PIPELINE,
     # The three Cosmos3 entries below are all opt-in: every Cosmos3 checkpoint
     # reports the same `model_type` and `model_index.json` `_class_name`, so none
     # of them may be auto-detected or it would capture the others' checkpoints.
