@@ -99,6 +99,7 @@ class DuplexSessionManager:
         result_sink: janus.AsyncQueue[EngineQueueMessage],
         runtime_config: DuplexSessionRuntimeConfig,
         model_config: ModelConfig | None,
+        log_stats: bool = False,
         clock: Callable[[], float] | None = None,
         executor: concurrent.futures.ThreadPoolExecutor | None = None,
     ) -> None:
@@ -106,6 +107,7 @@ class DuplexSessionManager:
         self.plugin = plugin
         self.stage_port = stage_port
         self.model_config = model_config
+        self.log_stats = bool(log_stats)
         self.runtime_config = runtime_config
         self._output_sink = output_sink
         self._result_sink = result_sink
@@ -499,6 +501,8 @@ class DuplexSessionManager:
                 lease=DuplexLeaseState(config=self._lease_config, generation=0, last_activity=self._clock()),
                 _clock=self._clock,
                 _runtime_config=dict(runtime_config),
+                num_stages=self.stage_port.stage_count,
+                log_stats=self.log_stats,
             )
             # Validates the plugin's sampling policy for this runtime config before admission.
             self.sampling_params_for(session)
@@ -699,7 +703,9 @@ class DuplexSessionManager:
         while not shutdown_event.is_set():
             try:
                 await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
-            except TimeoutError:
+            # The timeout is this loop's tick. asyncio.TimeoutError is not the builtin
+            # TimeoutError before Python 3.11, so catch both or the tick escapes the loop.
+            except (TimeoutError, asyncio.TimeoutError):
                 try:
                     await self.reap_expired()
                 except Exception:
