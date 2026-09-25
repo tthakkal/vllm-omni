@@ -1493,13 +1493,6 @@ class TestDisaggRegistryWiring:
 
         assert _EXTRA_SPECS[arch] == _EXTRA_SPECS["Cosmos3OmniDiffusersPipeline"]
 
-    def test_cache_dit_enabler_covers_the_denoising_stage_only(self):
-        from vllm_omni.diffusion.cache.cachedit import CUSTOM_DIT_ENABLERS
-
-        assert CUSTOM_DIT_ENABLERS["Cosmos3GeneratorPipeline"] is CUSTOM_DIT_ENABLERS["Cosmos3OmniDiffusersPipeline"]
-        # The reasoner has no gen_layers and no denoising steps to cache.
-        assert "Cosmos3ReasonerPipeline" not in CUSTOM_DIT_ENABLERS
-
 
 # =============================================================================
 # Shared text-conditioning resolvers

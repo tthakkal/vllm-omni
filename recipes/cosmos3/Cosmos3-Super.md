@@ -24,8 +24,6 @@ recommended parallelism differ. Mode is selected per request (T2I →
 - Model card (authoritative usage + example assets): <https://huggingface.co/nvidia/Cosmos3-Super>
 - Nano recipe (same APIs/params): [`Cosmos3-Nano.md`](./Cosmos3-Nano.md)
 - Pipeline: [`vllm_omni/diffusion/models/cosmos3/pipeline_cosmos3.py`](../../vllm_omni/diffusion/models/cosmos3/pipeline_cosmos3.py)
-- Experimental one-stage-per-tower T2I split, for when both towers do not fit on
-  one card: [`Cosmos3-TowerDisagg.md`](./Cosmos3-TowerDisagg.md)
 
 ## Hardware Support
 
