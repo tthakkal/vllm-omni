@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Cosmos3 topology registration, deploy YAMLs and per-stage device mapping.
+"""Cosmos3 disaggregated topology registration, deploy YAML and device mapping.
 
-Cosmos3 ships two topologies over the *same* checkpoint: the co-located
-``cosmos3_omni_colocated`` (both Mixture-of-Transformers towers in one diffusion
-stage) and the disaggregated ``cosmos3_omni_disagg`` (one stage per tower). The
-invariant these tests defend is that *neither* is auto-detectable: every Cosmos3
+``cosmos3_omni_disagg`` (one stage per Mixture-of-Transformers tower) is a second
+topology over the *same* checkpoint as the co-located ``cosmos3_omni_deploy``. The
+invariant these tests defend is that it is not auto-detectable: every Cosmos3
 checkpoint -- T2I, T2V/I2V/V2V and policy alike -- reports
 ``model_type=cosmos3_omni`` with ``model_index.json``
 ``_class_name=Cosmos3OmniDiffusersPipeline``, so a topology that claimed those
-would hijack the checkpoints of the other two. Each is reachable only through an
+would hijack every other Cosmos3 deployment. It is reachable only through an
 explicit ``pipeline:`` key in a deploy YAML, and a Cosmos3 deployment that names
 no pipeline keeps resolving through the single-stage diffusion fallback.
 """
@@ -32,7 +31,6 @@ from vllm_omni.diffusion.models.cosmos3_pipeline_config import (
     COSMOS3_ARCH,
     COSMOS3_DISAGG_PIPELINE,
     COSMOS3_GENERATOR_ARCH,
-    COSMOS3_PIPELINE,
     COSMOS3_REASONER_ARCH,
     COSMOS3_UND_KV_KEY,
     COSMOS3_UND_META_KEY,
@@ -41,7 +39,6 @@ from vllm_omni.entrypoints.stage_utils import resolve_stage_physical_devices
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
-COLOCATED_YAML = "cosmos3_super_t2i.yaml"
 DISAGG_YAML = "cosmos3_super_t2i_disagg.yaml"
 
 COSMOS3_HF_ARCH = "Cosmos3ForConditionalGeneration"
@@ -65,53 +62,22 @@ def _stage(deploy, stage_id: int):
 
 
 class TestTopologyRegistration:
-    def test_both_topologies_registered(self):
-        assert resolve_pipeline_config("cosmos3_omni_colocated") is COSMOS3_PIPELINE
+    def test_disagg_topology_registered(self):
         assert resolve_pipeline_config("cosmos3_omni_disagg") is COSMOS3_DISAGG_PIPELINE
 
-    def test_neither_topology_claims_the_bare_checkpoint_model_type(self):
+    def test_does_not_claim_the_bare_checkpoint_model_type(self):
         """``cosmos3_omni`` is the HF ``model_type`` of *every* Cosmos3 checkpoint.
 
-        Registering it would make whichever topology owned the key the
-        auto-detected answer for T2I, video and policy checkpoints alike. The
-        video case is the one that bites: this stage pins
-        ``final_output_type="image"`` while the single-stage fallback resolves
-        ``"video"`` for ``Cosmos3OmniDiffusersPipeline``, and the registry path
-        passes the pinned value through verbatim.
+        Registering it would make the disagg topology the auto-detected answer for
+        T2I, video and policy checkpoints alike.
         """
         assert "cosmos3_omni" not in OMNI_PIPELINES
 
-    def test_colocated_topology_is_a_single_diffusion_stage(self):
-        assert len(COSMOS3_PIPELINE.stages) == 1
-        stage = COSMOS3_PIPELINE.stages[0]
-        assert stage.model_stage == "diffusion"
-        assert stage.execution_type is StageExecutionType.DIFFUSION
-        assert stage.input_sources == ()
-        assert stage.final_output is True
-        assert stage.final_output_type == "image"
-        assert stage.model_arch == COSMOS3_ARCH
-
-    def test_colocated_topology_names_its_deploy_config(self):
-        """Safe to name only because the topology is unreachable without a YAML.
-
-        ``_get_deploy_config`` auto-loads a pipeline's default deploy YAML for
-        every caller that passes no ``--deploy-config``, which would be a problem
-        if this pipeline were auto-detected: it would push device count,
-        ``max_num_seqs``, ``enforce_eager``, ``gpu_memory_utilization`` and the
-        ``guardrails`` gate onto deployments that never asked for a deploy config.
-        It is not auto-detected -- the only route in is a YAML naming it -- so by
-        the time this resolves the caller has already supplied one and
-        ``_get_deploy_config`` returns *that* instead. Same reasoning as the
-        disagg config below. It is declared for the one path that does reach it:
-        selecting the topology programmatically with no deploy path.
-        """
-        assert COSMOS3_PIPELINE.default_deploy_config_name == COLOCATED_YAML
-
     def test_disagg_topology_is_one_stage_per_tower(self):
         reasoner, generator = COSMOS3_DISAGG_PIPELINE.stages
-        # Safe to name here, unlike on the co-located config: this topology is
-        # unreachable without a deploy config that selects it by name, so by the
-        # time it resolves the caller has already supplied one.
+        # Safe to name: this topology is unreachable without a deploy config that
+        # selects it by name, so by the time it resolves the caller has already
+        # supplied one.
         assert COSMOS3_DISAGG_PIPELINE.default_deploy_config_name == DISAGG_YAML
 
         assert (reasoner.stage_id, reasoner.model_stage) == (0, "reasoner")
@@ -147,11 +113,10 @@ class TestTopologyRegistration:
         assert bridge.META_KEY == COSMOS3_UND_META_KEY
 
 
-class TestBothTopologiesAreOptInOnly:
-    @pytest.mark.parametrize("pipeline_cfg", [COSMOS3_PIPELINE, COSMOS3_DISAGG_PIPELINE])
-    def test_declares_no_auto_detect_hooks(self, pipeline_cfg: PipelineConfig):
-        assert pipeline_cfg.hf_architectures == ()
-        assert pipeline_cfg.diffusers_class_name is None
+class TestDisaggTopologyIsOptInOnly:
+    def test_declares_no_auto_detect_hooks(self):
+        assert COSMOS3_DISAGG_PIPELINE.hf_architectures == ()
+        assert COSMOS3_DISAGG_PIPELINE.diffusers_class_name is None
 
     def test_no_pipeline_claims_the_cosmos3_architecture(self):
         """The arch fallback scans every registered pipeline; none may match.
@@ -195,17 +160,10 @@ class TestBothTopologiesAreOptInOnly:
             is None
         )
 
-    @pytest.mark.parametrize(
-        ("pipeline_key", "expected"),
-        [
-            ("cosmos3_omni_colocated", COSMOS3_PIPELINE),
-            ("cosmos3_omni_disagg", COSMOS3_DISAGG_PIPELINE),
-        ],
-    )
-    def test_deploy_pipeline_key_selects_the_topology(self, tmp_path, pipeline_key: str, expected: PipelineConfig):
-        """The one and only route into either topology."""
+    def test_deploy_pipeline_key_selects_the_topology(self, tmp_path):
+        """The one and only route into the topology."""
         deploy_path = tmp_path / "deploy.yaml"
-        deploy_path.write_text(f"pipeline: {pipeline_key}\n", encoding="utf-8")
+        deploy_path.write_text("pipeline: cosmos3_omni_disagg\n", encoding="utf-8")
 
         pipeline = StageConfigFactory.get_pipeline_config(
             model=str(tmp_path),
@@ -213,84 +171,7 @@ class TestBothTopologiesAreOptInOnly:
             deploy_config_path=str(deploy_path),
         )
 
-        assert pipeline is expected
-
-
-class TestColocatedDeployConfig:
-    def test_shipped_yaml_shape(self):
-        deploy = _deploy(COLOCATED_YAML)
-
-        # The `pipeline:` key is mandatory here, not decoration: the co-located
-        # topology declares no auto-detect hooks (it would capture the video and
-        # policy checkpoints), so this key is the only thing that selects it.
-        assert deploy.pipeline == "cosmos3_omni_colocated"
-        assert deploy.async_chunk is False
-        assert len(deploy.stages) == 1
-
-    def test_parallel_degrees_agree_with_the_device_count(self):
-        """The layout must satisfy the constraints its own degrees imply, whatever
-        it is scaled to.
-
-        The product of the parallel degrees has to equal WORLD (= len(devices)),
-        and `apply_hsdp` additionally raises unless hsdp_replicate_size x
-        hsdp_shard_size == WORLD. Asserting the invariants rather than the shipped
-        numbers means rescaling the YAML needs no test edit, but a YAML that would
-        raise at startup still fails here, without a GPU.
-        """
-        stage = _stage(_deploy(COLOCATED_YAML), 0)
-        parallel = stage.engine_extras["parallel_config"]
-        world = len(stage.devices.split(","))
-
-        # Degrees omitted from the YAML keep their DiffusionParallelConfig default of 1.
-        degree = 1
-        for key in ("cfg_parallel_size", "ulysses_degree", "ring_degree", "tensor_parallel_size"):
-            degree *= parallel.get(key, 1)
-        assert degree == world
-
-        if parallel.get("use_hsdp", False):
-            assert parallel.get("hsdp_replicate_size", 1) * parallel["hsdp_shard_size"] == world
-
-    def test_default_needs_no_collectives(self):
-        """One card holds all 120.91 GiB of both towers, and HSDP on two cards is
-        *slower* at 1024x1024 (439.4 vs 253.8 ms/step) because it all-gathers every
-        layer from the peer each step. So the default ships without collectives;
-        scaling out is for headroom (guardrails on, batching, >2048x2048)."""
-        stage = _stage(_deploy(COLOCATED_YAML), 0)
-
-        assert stage.devices == "0"
-        assert stage.engine_extras["parallel_config"]["use_hsdp"] is False
-
-    def test_yaml_keeps_the_guardrail_models_out_of_the_default_path(self):
-        """Cosmos3's pre-process hook eager-loads the *gated* guardrail models at
-        pipeline build time, so leaving them on makes this layout hard-fail
-        wherever `cosmos-guardrail` is not installed. `serve --no-guardrails` and
-        the offline example's `--extra-body` reach the same setting; `serve
-        --guardrails` overrides this line back on."""
-        stage = _stage(_deploy(COLOCATED_YAML), 0)
-        assert stage.engine_extras["model_config"]["guardrails"] is False
-
-    def test_yaml_pins_no_generation_parameters(self):
-        """A deployment file must not decide generation behaviour.
-
-        A pinned seed in particular would make every request that names no seed
-        return the same image for the life of the server; the rest
-        (num_inference_steps, guidance_scale, height, width) would shadow
-        Cosmos3's own T2I defaults while looking like deployment config.
-        """
-        stage = _stage(_deploy(COLOCATED_YAML), 0)
-        assert not stage.default_sampling_params
-
-    def test_merges_into_a_single_image_stage(self):
-        deploy = _deploy(COLOCATED_YAML)
-        stages = merge_pipeline_deploy(COSMOS3_PIPELINE, deploy)
-
-        assert len(stages) == 1
-        assert stages[0].model_stage == "diffusion"
-        assert stages[0].final_output_type == "image"
-        # The merge must carry every YAML knob through to the stage: a dropped
-        # `devices` is what silently collapses the layout onto one GPU.
-        assert stages[0].yaml_runtime["devices"] == _stage(deploy, 0).devices
-        assert stages[0].yaml_engine_args["model_config"]["guardrails"] is False
+        assert pipeline is COSMOS3_DISAGG_PIPELINE
 
 
 class TestDisaggDeployConfig:

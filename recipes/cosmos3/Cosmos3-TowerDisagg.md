@@ -5,7 +5,7 @@
 > **Experimental.** The tower split is opt-in, text-to-image only, and has no
 > published per-stage throughput numbers yet — only the memory and correctness
 > checks in [What has been measured](#what-has-been-measured). The co-located
-> [`vllm_omni/deploy/cosmos3_super_t2i.yaml`](../../vllm_omni/deploy/cosmos3_super_t2i.yaml)
+> [`vllm_omni/deploy/cosmos3_omni.yaml`](../../vllm_omni/deploy/cosmos3_omni.yaml)
 > layout remains the validated way to serve Cosmos3 T2I; see
 > [`Cosmos3-Super.md`](./Cosmos3-Super.md).
 
@@ -207,7 +207,10 @@ On 2×H200 (141 GB), Cosmos3-Super-Text2Image at 1024×1024, 50 steps, guidance
 | **disaggregated, TP 2** | **34.52 GiB / 33.13 GiB per rank** | byte-identical to baseline' |
 
 The tower split is numerically transparent: the images match bit for bit at both
-TP sizes. Changing TP *does* change pixels slightly — reduction order in the
+TP sizes, offline and through `/v1/images/generations`. Compare like with like:
+the shipped disagg YAML runs both stages with `enforce_eager: true`, so the
+co-located baseline needs `enforce_eager: true` too — `cosmos3_omni.yaml` leaves
+regional `torch.compile` on, which changes pixels by itself. Changing TP *does* change pixels slightly — reduction order in the
 sharded matmuls — but by the same amount in both layouts, so that delta is TP's,
 not the split's. At TP 2 the generator's ranks report `heads [0, 4) of 8` and
 `heads [4, 8) of 8`, and the payload is the same size as at TP 1, confirming the

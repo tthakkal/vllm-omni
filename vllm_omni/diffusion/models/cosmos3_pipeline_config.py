@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Cosmos3 topologies: co-located (one stage) and disaggregated (one per tower).
+"""Cosmos3 disaggregated topology: one stage per Mixture-of-Transformers tower.
 
 Cosmos3 is an Omni-modal foundation model built on a Mixture-of-Transformers
 (MoT) architecture with two complementary transformer towers:
@@ -10,8 +10,10 @@ Cosmos3 is an Omni-modal foundation model built on a Mixture-of-Transformers
   * GEN / ``generator`` -- the diffusion transformer for continuous multimodal
     generation (``Cosmos3VFMTransformer.gen_layers``).
 
-``Cosmos3OmniDiffusersPipeline`` co-locates both towers in one stage. This
-topology splits them into two independently-scheduled stage workers:
+``Cosmos3OmniDiffusersPipeline`` co-locates both towers in one stage (the
+opt-in ``cosmos3_omni_deploy`` topology in
+``model_executor/models/cosmos3/pipeline.py``, or the single-stage CLI fallback).
+This topology splits them into two independently-scheduled stage workers:
 
     stage 0 (reasoner) --per-layer text K/V--> stage 1 (generator) --> image
 
@@ -100,79 +102,9 @@ COSMOS3_GENERATOR_ARCH = "Cosmos3GeneratorPipeline"
 _COSMOS3_INPUT_PROCESSOR = "vllm_omni.model_executor.stage_input_processors.cosmos3"
 
 
-# The co-located topology: both towers in one Cosmos3OmniDiffusersPipeline stage
-# doing text encode + denoise + VAE decode together, parallelized *within* the
-# stage (CFG x Ulysses, with HSDP sharding the weights).
-#
-# WHY THIS IS REGISTERED AT ALL
-# -----------------------------
-# Nothing about co-located Cosmos3 needs a multi-stage topology, and it ran for a
-# long time without one -- an unregistered model_type resolves to no
-# PipelineConfig and the engine builds a lone default stage from CLI kwargs. But
-# a deploy YAML is only read *through* this registry: with no entry,
-# ``create_stage_configs`` returns None and every field in a ``stages:`` YAML is
-# silently discarded. So without a registered topology, no deploy YAML can
-# configure co-located Cosmos3 at all -- no per-stage ``devices``,
-# ``max_num_seqs``, ``parallel_config`` or ``guardrails`` gate.
-#
-# WHY IT IS KEYED ``cosmos3_omni_colocated`` AND NOT ``cosmos3_omni``
-# -------------------------------------------------------------------
-# Three different topologies share one set of HF metadata. T2I *and* T2V/I2V/V2V
-# checkpoints, and the policy checkpoints, all report ``model_type=cosmos3_omni``
-# with ``model_index.json`` ``_class_name=Cosmos3OmniDiffusersPipeline``, so the
-# checkpoint cannot tell them apart. Keying this entry on the bare
-# ``cosmos3_omni`` (or declaring ``hf_architectures`` /
-# ``diffusers_class_name``) would make it the auto-detected answer for all of
-# them, which breaks two things:
-#
-#   * ``final_output_type``. This stage pins ``"image"``, while the single-stage
-#     fallback resolves it dynamically through ``get_diffusion_output_type`` and
-#     gets ``"video"`` for ``Cosmos3OmniDiffusersPipeline`` (see
-#     ``_DIFFUSION_MODEL_METADATA``). The registry path passes ``final_output_type``
-#     through verbatim, so every T2V/I2V/V2V deployment would silently get its
-#     output relabelled as an image.
-#   * Policy checkpoints, which ``model_executor/models/cosmos3/pipeline.py``
-#     keeps on that same fallback for exactly this reason.
-#
-# So this topology follows the convention its two siblings already use --
-# ``cosmos3_policy`` and ``cosmos3_omni_disagg`` below: a distinct registry key,
-# no auto-detect hooks, and the only route in is an explicit
-# ``pipeline: cosmos3_omni_colocated`` in a deploy YAML, which
-# ``_get_deploy_override_pipe_config`` honours ahead of any inference.
-# ``deploy/cosmos3_super_t2i.yaml`` carries that key and is the recommended
-# single-GPU layout: ``--deploy-config cosmos3_super_t2i.yaml``. A bare
-# ``serve`` with no deploy config is untouched by this entry and keeps building
-# one default stage from CLI kwargs, exactly as before.
-COSMOS3_PIPELINE = PipelineConfig(
-    model_type="cosmos3_omni_colocated",
-    default_deploy_config_name="cosmos3_super_t2i.yaml",
-    model_arch="Cosmos3ForConditionalGeneration",
-    # Deliberately empty, and no ``diffusers_class_name`` -- see WHY IT IS KEYED
-    # ... above. Naming either would hand this config to every Cosmos3
-    # checkpoint, including the video and policy ones it is wrong for.
-    hf_architectures=(),
-    stages=(
-        StagePipelineConfig(
-            stage_id=0,
-            model_stage="diffusion",
-            execution_type=StageExecutionType.DIFFUSION,
-            input_sources=(),
-            owns_tokenizer=True,
-            # Cosmos3 also does image- and video-conditioned generation, so mm
-            # profiling stays on even though T2I never uses it.
-            requires_multimodal_data=True,
-            final_output=True,
-            final_output_type="image",
-            model_arch=COSMOS3_ARCH,
-        ),
-    ),
-)
-
-
-# Unlike the co-located entry above, naming a default deploy YAML here cannot
-# change anyone's defaults: this topology is unreachable without a deploy config
-# that selects it by name (see ``hf_architectures`` below), so by the time this
-# config is resolved the caller has already supplied one and
+# Naming a default deploy YAML here cannot change anyone's defaults: this
+# topology is unreachable without a deploy config that selects it by name (see
+# ``hf_architectures`` below), so by the time this config is resolved the caller has already supplied one and
 # ``_get_deploy_config`` returns that instead. It is declared for the one path
 # that does reach it -- selecting the topology programmatically, e.g.
 # ``get_pipeline_config(pipeline="cosmos3_omni_disagg")`` with no deploy path --
@@ -183,8 +115,8 @@ COSMOS3_DISAGG_PIPELINE = PipelineConfig(
     default_deploy_config_name="cosmos3_super_t2i_disagg.yaml",
     model_arch="Cosmos3ForConditionalGeneration",
     # Deliberately empty, and no ``diffusers_class_name``: this is a second
-    # topology over the *same* checkpoint as the ``cosmos3_omni_colocated``
-    # deployment, so it must never be auto-detected. Both auto-detect paths in
+    # topology over the *same* checkpoint as the co-located
+    # ``cosmos3_omni_deploy`` deployment, so it must never be auto-detected. Both auto-detect paths in
     # ``StageConfigFactory`` scan every registered pipeline -- the arch fallback
     # matches ``hf_architectures`` against ``hf_config.architectures``, and the
     # diffusers fallback matches ``diffusers_class_name`` against

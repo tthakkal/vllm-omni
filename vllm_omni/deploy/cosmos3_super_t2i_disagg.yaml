@@ -10,7 +10,7 @@
 # collectives at all: every parallel degree is 1 and HSDP is off. That makes it the
 # simplest possible disaggregated deploy -- and the one to reach for when NCCL is
 # unhealthy, since the only cross-GPU traffic left is the K/V handoff, which
-# travels through the Dynamo connector rather than NCCL.
+# travels through the stage connector rather than NCCL.
 #
 # THE HANDOFF IS NOT SMALL
 # ------------------------
@@ -55,7 +55,7 @@
 # vllm_omni/diffusion/models/cosmos3_pipeline_config.py -- and selected by the
 # `pipeline:` key below; this file only carries deployment knobs. `pipeline:` is
 # consulted by StageConfigFactory ahead of any HF model_type inference, which is
-# what keeps the `cosmos3_omni_colocated` deploy -- and every Cosmos3 deployment
+# what keeps the co-located `cosmos3_omni_deploy` -- and every Cosmos3 deployment
 # that names no pipeline at all -- unaffected by this topology merely existing in
 # the registry.
 pipeline: cosmos3_omni_disagg
@@ -154,8 +154,8 @@ stages:
       model_config:
         # Cosmos3 guardrails default ON and the pre-process hook eager-loads the
         # gated guardrail models at pipeline build time, hard-failing when
-        # `cosmos-guardrail` is not installed. Drop this line -- or pass
-        # `serve --guardrails` -- to enable them.
+        # `cosmos-guardrail` is not installed. Drop this line on both
+        # stages to enable them.
         #
         # Enabling them costs more here than co-located: both stages run the
         # stock pre-process hook and both receive the prompt text, so the text
