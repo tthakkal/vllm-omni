@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -1168,6 +1169,59 @@ def test_minicpmo_seeded_text_survives_explicit_initial_listen():
     model.prepare_duplex_sampling(next_logits, SimpleNamespace(), (next_row,))
     assert torch.isfinite(next_logits).all()
     assert state.pending_speech_context is True
+
+
+@pytest.mark.parametrize("initial_text", [None, "", "Please say hello.", "请说你好。"])
+@pytest.mark.parametrize("speech_envelope", [False, True])
+def test_minicpmo_seeded_context_keeps_assistant_turn_open_until_eos(initial_text, speech_envelope, mocker):
+    from vllm.v1.sample.metadata import SamplingMetadata
+
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="seeded-context")
+    runtime._prepare_session_context(state, {}, runtime_config={"initial_user_text": initial_text})
+    result = runtime._stage_prefill_embeddings_only(
+        state, np.zeros(4, dtype=np.float32), epoch=0, seq=1, is_speech=False
+    )
+    assert result["success"] is True
+    model, row = _minicpmo_duplex_policy_case(state, {"is_speech": False})
+    logits = torch.zeros((1, 16), dtype=torch.float32)
+    logits[0, 10] = 20.0
+    original_logits = logits.clone()
+    sampling_metadata = mocker.Mock(spec=SamplingMetadata)
+    model.prepare_duplex_sampling(logits, sampling_metadata, (row,))
+    token_ids = model._minicpmo45_native_duplex_token_ids_cache
+    sampled = model._finalize_minicpmo45_native_duplex_sample(0, 7, token_ids)
+
+    if not initial_text:
+        assert sampled == 7
+        assert logits[0, 7].item() == 0.0
+        assert torch.isneginf(logits[0, :7]).all()
+        assert torch.isneginf(logits[0, 8:]).all()
+        return
+
+    assert torch.equal(logits, original_logits)
+    assert sampled == 8
+    if speech_envelope:
+        model._record_minicpmo45_duplex_terminator(0, 8, token_ids)
+        assert state.current_turn_ended is False
+        assert state.pending_speech_context is True
+    model._record_minicpmo45_duplex_terminator(0, 10, token_ids)
+    assert state.pending_speech_context is False
+    model._record_minicpmo45_duplex_terminator(0, 9, token_ids)
+
+    # A later silent unit must not re-admit the seed after the turn ended.
+    result = runtime._stage_prefill_embeddings_only(
+        state, np.zeros(4, dtype=np.float32), epoch=0, seq=2, is_speech=False
+    )
+    assert result["success"] is True
+    logits = original_logits.clone()
+    model.prepare_duplex_sampling(logits, sampling_metadata, (replace(row, seq=4),))
+    assert logits[0, 7].item() == 0.0
+    assert torch.isneginf(logits[0, :7]).all()
+    assert torch.isneginf(logits[0, 8:]).all()
+    assert model._finalize_minicpmo45_native_duplex_sample(0, 7, token_ids) == 7
 
 
 def test_minicpmo_stage0_puts_every_frame_of_an_append_in_one_unit():
