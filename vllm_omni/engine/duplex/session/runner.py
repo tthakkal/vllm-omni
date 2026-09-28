@@ -1107,6 +1107,7 @@ class DuplexSessionRunner:
             operation_id=operation_id,
             retained_committed_payload=retained_committed_payload,
             precreated_response_id=session.active_response_id if precreate_response else None,
+            owns_request=final or precreate_response,
             on_append_accepted=on_append_accepted,
             before_append=before_append,
         )
@@ -1486,7 +1487,8 @@ class DuplexSessionRunner:
             active_task.cancel()
             try:
                 await asyncio.wait_for(asyncio.gather(active_task, return_exceptions=True), timeout=0.25)
-            except TimeoutError:
+            # asyncio.TimeoutError is not the builtin TimeoutError before Python 3.11.
+            except (TimeoutError, asyncio.TimeoutError):
                 pass
         if notify:
             self.emit(

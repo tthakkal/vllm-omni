@@ -356,6 +356,9 @@ class OmniEngineBase:
             from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
 
             model_class_name = resolve_model_class_name(self.model)
+            if model_class_name is None:
+                # use registered diffusers cls name as fallback
+                model_class_name = getattr(self.pipeline_config, "diffusers_class_name", None)
             metadata = get_diffusion_model_metadata(model_class_name)
             self._diffusion_od_config_view = SimpleNamespace(
                 model_class_name=model_class_name,
@@ -422,7 +425,7 @@ class OmniEngineBase:
             for client in self.stage_clients
         ]
         supported_tasks: set[str] = set()
-        if any(getattr(client, "is_comprehension", False) for client in self.stage_clients):
+        if any(getattr(stage_config, "is_comprehension", False) for stage_config in self.stage_configs):
             supported_tasks.add("generate")
         if any(meta.final_output_type == "audio" for meta in self.stage_metadata):
             supported_tasks.add("speech")

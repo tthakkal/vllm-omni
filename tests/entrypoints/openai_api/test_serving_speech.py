@@ -12,10 +12,12 @@ import os
 import struct
 import wave
 from dataclasses import FrozenInstanceError, replace
+from http import HTTPStatus
 from inspect import Signature, signature
 from pathlib import Path
 from types import SimpleNamespace
 
+import anyio
 import numpy as np
 import pytest
 import torch
@@ -36,6 +38,7 @@ from vllm_omni.entrypoints.omni_base import OmniEngineDeadError
 from vllm_omni.entrypoints.openai import api_server as api_server_module
 from vllm_omni.entrypoints.openai import serving_speech as serving_speech_module
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
+from vllm_omni.entrypoints.openai.errors import InvalidPresetVoiceReferenceError, InvalidVoiceReferenceError
 from vllm_omni.entrypoints.openai.protocol.audio import (
     BatchSpeechRequest,
     CreateAudio,
@@ -329,10 +332,12 @@ def test_app(mocker: MockerFixture, tmp_path, monkeypatch):
     # Add delete_voice endpoint
     async def delete_voice(name: str):
         try:
-            success = await speech_server.delete_voice(name)
-            if not success:
-                raise HTTPException(status_code=404, detail=f"Voice '{name}' not found")
+            await speech_server.delete_voice(name)
             return {"success": True, "message": f"Voice '{name}' deleted successfully"}
+        except InvalidPresetVoiceReferenceError as e:
+            raise HTTPException(status_code=403, detail=str(e))
+        except InvalidVoiceReferenceError as e:
+            raise HTTPException(status_code=404, detail=str(e))
         except HTTPException:
             raise
         except ValueError as e:
@@ -505,6 +510,75 @@ class TestSpeechAPI:
         assert voice_info["file_size"] == len(audio_content)
         response = client.delete("/v1/audio/voices/test_voice")
 
+    def test_upload_voice_rejects_builtin_name(self, client):
+        """A name colliding with a built-in or precomputed voice is rejected."""
+        handler = client.app.state.openai_serving_speech
+        handler._adapter.capabilities.supported_speakers = {"vivian"}
+        handler._adapter.capabilities.precomputed_speakers = {"ono_anna": {}}
+
+        files = {"audio_sample": ("test.wav", b"fake audio content" * 1000, "audio/wav")}
+        for reserved in ("Vivian", "ono_anna"):
+            response = client.post("/v1/audio/voices", files=files, data={"consent": "c1", "name": reserved})
+            assert response.status_code == 400
+            assert "reserved" in response.json()["detail"]
+        assert not handler.uploaded_speakers
+
+    def test_upload_voice_overwrites_same_name_by_default(self, client):
+        """Default policy: re-registering an uploaded name replaces it in place."""
+        files = {"audio_sample": ("test.wav", b"first take", "audio/wav")}
+        data = {"consent": "c1", "name": "test_voice_ow"}
+        assert client.post("/v1/audio/voices", files=files, data=data).status_code == 200
+
+        files = {"audio_sample": ("test.wav", b"second take, longer content", "audio/wav")}
+        response = client.post("/v1/audio/voices", files=files, data=data)
+        assert response.status_code == 200
+        assert response.json()["voice"]["file_size"] == len(b"second take, longer content")
+        client.delete("/v1/audio/voices/test_voice_ow")
+
+    def test_upload_voice_immutable_policy_requires_delete(self, client):
+        """VLLM_OMNI_SPEAKER_REGISTRATION_POLICY=immutable rejects duplicates until deleted."""
+        handler = client.app.state.openai_serving_speech
+        handler._registration_policy = "immutable"
+        try:
+            files = {"audio_sample": ("test.wav", b"fake audio content" * 1000, "audio/wav")}
+            data = {"consent": "c1", "name": "test_voice_imm"}
+            assert client.post("/v1/audio/voices", files=files, data=data).status_code == 200
+
+            response = client.post("/v1/audio/voices", files=files, data=data)
+            assert response.status_code == 400
+            assert "immutable" in response.json()["detail"]
+
+            assert client.delete("/v1/audio/voices/test_voice_imm").status_code == 200
+            assert client.post("/v1/audio/voices", files=files, data=data).status_code == 200
+        finally:
+            handler._registration_policy = "overwrite"
+            client.delete("/v1/audio/voices/test_voice_imm")
+
+    def test_invalid_registration_policy_fails_startup(self, mocker, monkeypatch, tmp_path):
+        """An unknown VLLM_OMNI_SPEAKER_REGISTRATION_POLICY is a configuration error, not a silent fallback."""
+        monkeypatch.setenv("SPEAKER_SAMPLES_DIR", str(tmp_path))
+        monkeypatch.setenv("VLLM_OMNI_SPEAKER_REGISTRATION_POLICY", "append")
+        engine_client = mocker.MagicMock()
+        engine_client.default_sampling_params_list = [{}]
+        with pytest.raises(ValueError, match="VLLM_OMNI_SPEAKER_REGISTRATION_POLICY"):
+            OmniOpenAIServingSpeech(
+                engine_client=engine_client, models=mocker.MagicMock(), request_logger=mocker.MagicMock()
+            )
+
+    def test_restored_upload_shadowing_builtin_is_dropped(self, client):
+        """A pre-guard upload restored under a built-in name must not keep shadowing it."""
+        handler = client.app.state.openai_serving_speech
+        handler._adapter.capabilities.supported_speakers = {"vivian"}
+        handler._adapter.capabilities.precomputed_speakers = {}
+        handler.uploaded_speakers["vivian"] = {"name": "vivian", "file_path": "/tmp/vivian.safetensors"}
+        handler.uploaded_speakers["keep_me"] = {"name": "keep_me", "file_path": "/tmp/keep_me.safetensors"}
+
+        handler._drop_shadowing_uploads()
+
+        assert "vivian" not in handler.uploaded_speakers
+        assert "keep_me" in handler.uploaded_speakers
+        handler.uploaded_speakers.pop("keep_me")
+
     def test_upload_voice_with_ref_text(self, client, tmp_path):
         """Test voice upload with ref_text enables in-context cloning."""
         audio_content = b"fake audio content" * 1000
@@ -522,7 +596,8 @@ class TestSpeechAPI:
     def test_upload_voice_with_speaker_description(self, client, tmp_path):
         """Test voice upload with speaker_description stores and returns the description."""
         # Pre-cleanup in case a previous test run left this voice behind
-        client.delete("/v1/audio/voices/test_voice_vd")
+        response = client.delete("/v1/audio/voices/test_voice_vd")
+        assert response.status_code == 404 or response.status_code == 200
 
         audio_content = b"fake audio content" * 1000
         files = {"audio_sample": ("test.wav", audio_content, "audio/wav")}
@@ -540,7 +615,9 @@ class TestSpeechAPI:
 
     def test_upload_voice_speaker_description_in_listing(self, client):
         """Test that speaker_description survives the upload → list round-trip."""
-        client.delete("/v1/audio/voices/test_voice_sd_list")
+        # Pre-cleanup in case a previous test run left this voice behind
+        response = client.delete("/v1/audio/voices/test_voice_sd_list")
+        assert response.status_code == 404 or response.status_code == 200
 
         audio_content = b"fake audio content" * 1000
         files = {"audio_sample": ("test.wav", audio_content, "audio/wav")}
@@ -941,6 +1018,44 @@ class TestTTSMethods:
 
         assert speed == 1.25
         resolve_adapter.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_speech_cuda_oom_returns_internal_server_error(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        mocker.patch.object(speech_server, "_check_model", new=mocker.AsyncMock(return_value=None))
+        mocker.patch.object(
+            speech_server,
+            "_generate_audio_bytes",
+            new=mocker.AsyncMock(side_effect=torch.OutOfMemoryError("CUDA out of memory")),
+        )
+
+        response = await speech_server.create_speech(OpenAICreateSpeechRequest(input="Hello"))
+
+        assert isinstance(response, ErrorResponse)
+        assert response.error.code == HTTPStatus.INTERNAL_SERVER_ERROR
+        assert response.error.type == "InternalServerError"
+
+    @pytest.mark.asyncio
+    async def test_create_speech_unexpected_failure_returns_internal_server_error(
+        self,
+        speech_server,
+        mocker: MockerFixture,
+    ):
+        mocker.patch.object(speech_server, "_check_model", new=mocker.AsyncMock(return_value=None))
+        mocker.patch.object(
+            speech_server,
+            "_generate_audio_bytes",
+            new=mocker.AsyncMock(side_effect=RuntimeError("codec failed")),
+        )
+
+        response = await speech_server.create_speech(OpenAICreateSpeechRequest(input="Hello"))
+
+        assert isinstance(response, ErrorResponse)
+        assert response.error.code == HTTPStatus.INTERNAL_SERVER_ERROR
+        assert response.error.type == "InternalServerError"
 
     def test_is_tts_detection_no_stage(self, speech_server):
         """Test TTS model detection when no TTS stage exists."""
@@ -2426,7 +2541,7 @@ class TestTTSMethods:
         )
 
         assert speech_server._is_tts is False
-        assert load_supported_speakers(speech_server.engine_client) == set()
+        assert load_supported_speakers(speech_server.engine_client) == []
         warning.assert_not_called()
 
     def test_load_supported_languages_from_config(self, speech_server):
@@ -3855,11 +3970,19 @@ class TestAsyncOmniSupportedTasks:
         assert "generate" in tasks
 
 
-def test_api_server_create_speech_wraps_error_response_status(mocker: MockerFixture):
+@pytest.mark.parametrize(
+    ("status_code", "err_type"),
+    [(HTTPStatus.BAD_REQUEST, "BadRequestError"), (HTTPStatus.INTERNAL_SERVER_ERROR, "InternalServerError")],
+)
+def test_api_server_create_speech_wraps_error_response_status(
+    mocker: MockerFixture,
+    status_code: HTTPStatus,
+    err_type: str,
+):
     handler = mocker.MagicMock()
     handler.create_speech = mocker.AsyncMock(
         return_value=ErrorResponse(
-            error=ErrorInfo(message="bad request", type="BadRequestError", param=None, code=400),
+            error=ErrorInfo(message="speech failed", type=err_type, param=None, code=status_code),
         )
     )
 
@@ -3868,7 +3991,12 @@ def test_api_server_create_speech_wraps_error_response_status(mocker: MockerFixt
 
     response = asyncio.run(api_server_module.create_speech(request, raw_request))
 
-    _assert_openai_error_response(response, status_code=400, message="bad request")
+    _assert_openai_error_response(
+        response,
+        status_code=status_code,
+        message="speech failed",
+        err_type=err_type,
+    )
 
 
 def _make_api_server_request(handler, *, method: str = "POST", path: str = "/v1/audio/voices") -> Request:
@@ -3956,7 +4084,7 @@ def test_voice_routes_without_tokenization(mocker: MockerFixture, method: str, h
     if handler is not None:
         handler._get_available_voices.return_value = []
         handler.uploaded_speakers = {}
-        handler.delete_voice = mocker.AsyncMock(return_value=False)
+        handler.delete_voice = mocker.AsyncMock(side_effect=InvalidVoiceReferenceError("Voice 'missing' not found"))
     app = _make_api_server_request(handler).app
     app.add_api_route("/v1/audio/voices", api_server_module.list_voices, methods=["GET"])
     app.add_api_route("/v1/audio/voices", api_server_module.upload_voice, methods=["POST"])
@@ -4101,7 +4229,7 @@ def test_api_server_delete_voice_value_error_returns_400(mocker: MockerFixture):
 
 def test_api_server_delete_voice_not_found_returns_404(mocker: MockerFixture):
     handler = mocker.MagicMock()
-    handler.delete_voice = mocker.AsyncMock(return_value=False)
+    handler.delete_voice = mocker.AsyncMock(side_effect=InvalidVoiceReferenceError("Voice 'missing' not found"))
     raw_request = _make_api_server_request(handler, method="DELETE", path="/v1/audio/voices/missing")
 
     response = asyncio.run(api_server_module.delete_voice("missing", raw_request))
@@ -4111,6 +4239,43 @@ def test_api_server_delete_voice_not_found_returns_404(mocker: MockerFixture):
         status_code=404,
         message="Voice 'missing' not found",
         err_type="NotFoundError",
+    )
+
+
+def test_api_server_delete_built_in_voice_returns_403(mocker: MockerFixture):
+    handler = mocker.MagicMock()
+    handler.uploaded_speakers = set()
+    handler._get_available_speakers = mocker.Mock(return_value=set("built-in"))
+    handler.delete_voice = mocker.AsyncMock(
+        side_effect=InvalidPresetVoiceReferenceError("Cannot delete built-in voice 'built-in'")
+    )
+    raw_request = _make_api_server_request(handler, method="DELETE", path="/v1/audio/voices/built-in")
+
+    response = asyncio.run(api_server_module.delete_voice("built-in", raw_request))
+
+    _assert_openai_error_response(
+        response,
+        status_code=403,
+        message="Cannot delete built-in voice 'built-in'",
+        err_type="ForbiddenError",
+    )
+
+
+def test_api_server_delete_default_voice_returns_403(mocker: MockerFixture):
+    handler = mocker.MagicMock()
+    handler.uploaded_speakers = set()
+    handler.delete_voice = mocker.AsyncMock(
+        side_effect=InvalidPresetVoiceReferenceError("Cannot delete built-in voice 'default'")
+    )
+    raw_request = _make_api_server_request(handler, method="DELETE", path="/v1/audio/voices/default")
+
+    response = asyncio.run(api_server_module.delete_voice("default", raw_request))
+
+    _assert_openai_error_response(
+        response,
+        status_code=403,
+        message="Cannot delete built-in voice 'default'",
+        err_type="ForbiddenError",
     )
 
 
@@ -5081,6 +5246,7 @@ class TestTTSAsyncOffloading:
             models=mock_models,
             request_logger=mocker.MagicMock(),
         )
+        server.uploaded_speakers = {}
         yield server
         server.shutdown()
 
@@ -5437,8 +5603,9 @@ class TestTTSAsyncOffloading:
         assert prompt["additional_information"]["non_streaming_mode"] == [True]
         assert "full_utterance_decode" not in prompt["additional_information"]
 
-    def test_qwen3_repeated_ref_audio_hot_path_sends_cache_key_without_waveform(self, qwen3_tts_server):
-        """After a ref artifact is marked ready, repeated requests avoid ref_audio payload IPC."""
+    def test_qwen3_inline_ref_audio_hot_path_does_not_use_named_speaker_cache(self, qwen3_tts_server, mocker):
+        """An OpenAI-compatible voice does not identify an inline voice clone."""
+        ignored_voice_log = mocker.patch("vllm_omni.entrypoints.openai.tts_adapters.qwen3_tts.logger.info")
         wav_list = [0.0] * 48000
         artifact_key = "a" * 40
         ref_audio = "data:audio/wav;base64,same"
@@ -5461,6 +5628,7 @@ class TestTTSAsyncOffloading:
 
         request = OpenAICreateSpeechRequest(
             input="hello",
+            voice="voice-a",
             task_type="Base",
             ref_audio=ref_audio,
             ref_text="reference",
@@ -5470,7 +5638,14 @@ class TestTTSAsyncOffloading:
         )
 
         assert request_id == "req-hot"
+        assert request.voice == "voice-a"
+        ignored_voice_log.assert_called_once_with(
+            "Ignoring voice=%r for Qwen3-TTS Base request because inline ref_audio takes precedence",
+            "voice-a",
+        )
         assert "ref_audio" not in tts_params
+        assert "speaker" not in tts_params
+        assert "voice_created_at" not in tts_params
         assert tts_params["_qwen3_tts_ref_audio_cache_key"] == [artifact_key]
         assert tts_params["ref_code_length"] == [50]
         prompt = qwen3_tts_server.engine_client.generate.call_args.kwargs["prompt"]
@@ -5700,21 +5875,34 @@ class TestTTSAsyncOffloading:
 
     @pytest.mark.asyncio
     async def test_generate_audio_chunks_discards_ref_audio_artifact_warmup_on_close(self, qwen3_tts_server):
+        closed = asyncio.Event()
+
         async def pcm_generator():
-            yield SimpleNamespace(
-                multimodal_output={
-                    "audio": torch.zeros(16, dtype=torch.float32),
-                    "sr": 24000,
-                }
-            )
-            await asyncio.sleep(0)
+            try:
+                yield OmniRequestOutput(
+                    request_id="req-close",
+                    final_output_type="audio",
+                    _multimodal_output={
+                        "audio": torch.zeros(16, dtype=torch.float32),
+                        "sr": 24000,
+                    },
+                )
+            finally:
+                # Engine abort waits for stage acknowledgments. Retain an
+                # actual cancellation checkpoint to cover ASGI cancel scopes.
+                await anyio.sleep(0)
+                closed.set()
 
         qwen3_tts_server._request_ref_audio_artifact_keys["req-close"] = ("artifact-close", False)
 
-        stream = qwen3_tts_server._generate_audio_chunks(pcm_generator(), "req-close")
+        engine_stream = pcm_generator()
+        stream = qwen3_tts_server._generate_audio_chunks(engine_stream, "req-close")
         assert await anext(stream)
-        await stream.aclose()
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            await stream.aclose()
 
+        assert closed.is_set()
         assert "req-close" not in qwen3_tts_server._request_ref_audio_artifact_keys
         assert ("artifact-close", False) not in qwen3_tts_server._ref_audio_model_artifact_ready
 

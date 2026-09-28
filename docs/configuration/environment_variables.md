@@ -88,6 +88,7 @@ depends on the installed kernels and model path.
 | `VLLM_OMNI_EVENT_DRIVEN_ORCH` | `1`, `true`, `yes` or `on` enables; defaults to on for Qwen3-TTS and off for other pipelines | Pipeline default computed from `pipeline_config.model_type` at engine initialization; env override resolved at `Orchestrator` construction and separately when the serving-side final-output drain starts | An explicit env value wins; otherwise both consumers use the engine's pipeline default. Values are stripped and case-normalized; any unrecognized value selects the legacy poll loop. Set before server startup. | Experimental |
 | `VLLM_OMNI_INPUT_WAIT_TIMEOUT_S` | Float seconds; default `600`; `<=0` disables | Full-payload input coordinator, not async-chunk transfer; read when the scheduler module imports in each worker | Environment-only setting. A non-float logs a warning and uses `600`. | Stable operational control |
 | `VLLM_OMNI_ORCH_MONITOR_PATH` | Filesystem path; default `<current-working-directory>/vllm_omni_orch_monitor_<timestamp>.json` | Orchestrator monitor enabled by `--enable-orch-monitor`; read when the monitor is created | Environment-only path override. Parent directories are created; write errors are logged. | Diagnostic |
+| `VLLM_OMNI_SPEAKER_REGISTRATION_POLICY` | `overwrite` or `immutable`; default `overwrite` | Speech server; read when speaker storage initializes | Environment-only setting. `immutable` rejects re-registering an existing uploaded voice name until it is deleted; any other value raises `ValueError` at startup. | Experimental |
 | `VLLM_OMNI_VIDEO_SYNC_TIMEOUT` | Float seconds; default `600` | Synchronous Videos API; read when the API server module imports | Environment-only setting. A non-float raises `ValueError` during import. | Experimental |
 | `VLLM_VIDEO_ASYNC_CHUNK` | `on` or `off`; default `on` | Streaming video output; read on attribute access | Environment-only setting. Values are trimmed and case-normalized; an invalid value warns once and uses `on`. | Experimental |
 | `VLLM_VIDEO_AUDIO_DELTA_MODE` | `fast` or `slow`; default `fast` | Streaming video audio deltas; read on attribute access | Environment-only setting. Values are trimmed and case-normalized; an invalid value warns once and uses `fast`. | Experimental |
@@ -129,6 +130,22 @@ settings.
 Omni-owned variable, even though vLLM-Omni supplies a persistent default when
 it is unset.
 
+### Torch compilation
+
+| Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
+| --- | --- | --- | --- | --- |
+| `VLLM_OMNI_TORCH_DYNAMO_RECOMPILE_LIMIT` | Positive integer; unset preserves the current Torch setting | Process default for Torch Dynamo; read when `vllm_omni` is imported | Sets `torch._dynamo.config.recompile_limit` to the requested value. A non-positive or non-integer value raises `ValueError`. Later backend-specific overrides still take precedence. | Diagnostic |
+
+Set this variable before launching Omni, for example:
+
+```bash
+export VLLM_OMNI_TORCH_DYNAMO_RECOMPILE_LIMIT=64
+```
+
+The setting applies across model families and platforms. vLLM compilation
+contexts and backends can subsequently apply their own limits; this variable
+does not replace those backend-specific policies.
+
 ## Per-stage environment
 
 Deploy configurations can set arbitrary environment keys for one stage:
@@ -161,7 +178,7 @@ their keys only.
 ## Inherited vLLM variables
 
 vLLM-Omni also reads variables through its aligned vLLM dependency. Refer to
-the [vLLM 0.29 environment-variable reference](https://docs.vllm.ai/en/v0.29.0/configuration/env_vars.html)
+the [vLLM 0.30 environment-variable reference](https://docs.vllm.ai/en/v0.30.0/configuration/env_vars.html)
 for their definitions. This includes vLLM launch, cache, logging, plugin, ROCm,
 XPU, ModelScope, and FlashInfer workspace settings.
 
