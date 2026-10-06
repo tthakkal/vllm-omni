@@ -41,7 +41,8 @@ def _replace_groupnorm_with_aiter(vae: nn.Module) -> bool:
 def _patched_initialize_model(od_config):
     model = _original_initialize_model(od_config)
 
-    if hasattr(model, "vae"):
+    # ``vae`` may be ``None`` on a stage that never decodes (Cosmos3's reasoner).
+    if getattr(model, "vae", None) is not None:
         try:
             from vllm._aiter_ops import is_aiter_found_and_supported
 

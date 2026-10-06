@@ -89,12 +89,16 @@ and are filtered out by the inherited ``load_weights``. ``_require_unowned_absen
 then verifies the ownership request was honoured, so a transformer that ignores it
 fails loudly instead of quietly doubling startup memory.
 
+The VAE follows the same rule. Only the generator decodes, so the reasoner sets
+``cosmos3_loads_vae = False`` and reads just the VAE config (for its scale factors)
+instead of loading the weights onto the card.
+
 WHAT THE SPLIT DOES *NOT* SAVE: CHECKPOINT READS
 -----------------------------------------------
-Both stages still stream the whole checkpoint. ``Cosmos3.load_weights`` filters
-by name *after* ``safetensors_weights_iterator`` has already materialized each
-tensor, so the unowned tower's tensors are read from disk and discarded rather
-than skipped (the "kept N/M tensors" line it logs is the filter, not the read).
+Both stages still stream the whole transformer checkpoint.
+``Cosmos3.load_weights`` filters by name *after* ``safetensors_weights_iterator``
+has already materialized each tensor, so the unowned tower's tensors are read
+from disk and discarded rather than skipped (the "kept N/M tensors" line it logs is the filter, not the read).
 Splitting the towers therefore roughly doubles aggregate startup read I/O across
 the two stages instead of halving it. Fixing that means teaching the loader to
 skip tensors by name before materializing them, which is a loader change and not
@@ -105,7 +109,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import torch
 from vllm.distributed import (
@@ -147,6 +151,7 @@ from .pipeline_cosmos3 import (  # noqa: F401  (re-export)
 from .pipeline_cosmos3 import (  # noqa: F401  (re-export)
     get_cosmos3_pre_process_func as get_cosmos3_pre_process_func,
 )
+from .transformer_cosmos3 import Cosmos3CrossAttention
 
 logger = init_logger(__name__)
 
@@ -637,6 +642,14 @@ class Cosmos3ReasonerPipeline(_Cosmos3TowerPipeline):
     #: Only the UND tower is constructed here: no GEN blocks are allocated at all.
     cosmos3_owned_towers: ClassVar[tuple[str, ...]] = ("reasoner",)
 
+    #: Nothing here encodes or decodes pixels, so the VAE weights are never loaded
+    #: -- only its config, for the spatial scale factor ``encode_text_conditioning``
+    #: needs to size the GEN latent grid. ``vae`` is therefore ``None`` on this
+    #: stage, and it is dropped from the offloadable components so module discovery
+    #: does not go looking for it.
+    cosmos3_loads_vae: ClassVar[bool] = False
+    _vae_modules: ClassVar[list[str]] = []
+
     # Skip the engine's synthetic warmup run. Same mechanism as the generator
     # (see that class), different trigger: ``_dummy_run`` builds
     # ``{"prompt": "dummy run"}`` with no ``modalities`` key, and stock Cosmos3
@@ -749,9 +762,10 @@ class Cosmos3ReasonerPipeline(_Cosmos3TowerPipeline):
         # ``wan2_2/wan2_2_s2v_transformer.py`` (``encode_audio``) does exactly
         # this for the same reason. The guard keeps the non-HSDP path working,
         # where these methods do not exist.
-        is_fsdp = hasattr(transformer, "unshard") and hasattr(transformer, "reshard")
-        if is_fsdp:
-            transformer.unshard()
+        # Typed ``Any``: ``unshard``/``reshard`` are added by FSDP2 at runtime.
+        fsdp_root: Any = transformer if hasattr(transformer, "unshard") and hasattr(transformer, "reshard") else None
+        if fsdp_root is not None:
+            fsdp_root.unshard()
         try:
             branches: dict[str, KVBranch] = {}
             for text_ids, text_mask in branches_to_encode:
@@ -779,8 +793,8 @@ class Cosmos3ReasonerPipeline(_Cosmos3TowerPipeline):
                     for k, v in cached_kv_full
                 ]
         finally:
-            if is_fsdp:
-                transformer.reshard()
+            if fsdp_root is not None:
+                fsdp_root.reshard()
 
         payload_mib = (
             sum(
@@ -867,7 +881,8 @@ class Cosmos3GeneratorPipeline(_Cosmos3TowerPipeline):
         # ``num_kv_heads // tp_size`` for itself at construction time, so taking it
         # from there cannot disagree with the consumer.
         consumer = self._kv_consumer()
-        transformer.language_model = _ReplayLanguageModel(
+        # The stub deliberately replaces the declared ``Cosmos3LanguageModel``.
+        transformer.language_model = _ReplayLanguageModel(  # type: ignore[assignment]
             transformer.num_hidden_layers,
             language_model.rotary_emb,
             num_kv_heads=consumer.num_kv_heads,
@@ -876,7 +891,7 @@ class Cosmos3GeneratorPipeline(_Cosmos3TowerPipeline):
             head_dim=consumer.head_dim,
         )
 
-    def _kv_consumer(self) -> torch.nn.Module:
+    def _kv_consumer(self) -> Cosmos3CrossAttention:
         """The ``Cosmos3CrossAttention`` that consumes the replayed UND K/V.
 
         Every GEN block has one and they are all built from the same config, so the
@@ -888,7 +903,7 @@ class Cosmos3GeneratorPipeline(_Cosmos3TowerPipeline):
                 "Cosmos3 generator stage has no GEN blocks, so there is nothing to "
                 "replay reasoner K/V into. The stage did not build the tower it owns."
             )
-        return gen_layers[0].cross_attention
+        return cast(Cosmos3CrossAttention, gen_layers[0].cross_attention)
 
     def forward(self, req: Any) -> Any:  # type: ignore[override]
         """Install the reasoner K/V, then run the stock denoise + decode path.
@@ -903,44 +918,37 @@ class Cosmos3GeneratorPipeline(_Cosmos3TowerPipeline):
         try:
             return super().forward(req)
         finally:
-            self.transformer.language_model.clear()
+            self._replay_stub().clear()
 
     @staticmethod
     def _extract_und_payload(req: Any) -> dict[str, Any]:
-        """Find the reasoner payload on the incoming request.
-
-        ``prompt["extra"]`` is where ``reasoner2generator`` puts it. The
-        ``sampling_params.extra_args`` fallback mirrors GLM-Image's DiT stage,
-        which accepts ``prior_token_ids`` from either place -- handy for driving
-        this stage directly in a single-process test.
-        """
+        """Find the reasoner payload in ``prompt["extra"]``, where ``reasoner2generator`` puts it."""
         prompt_data = req.prompts[0] if req.prompts else ""
         if isinstance(prompt_data, dict):
             extra = prompt_data.get("extra") or {}
             if KV_KEY in extra:
                 return extra
 
-        sp = getattr(req, "sampling_params", None)
-        extra_args = getattr(sp, "extra_args", None) or {}
-        if KV_KEY in extra_args:
-            return extra_args
-
         raise ValueError(
             "Cosmos3 generator stage received a request without reasoner K/V in "
-            f"prompt['extra'][{KV_KEY!r}] or sampling_params.extra_args[{KV_KEY!r}]. "
+            f"prompt['extra'][{KV_KEY!r}]. "
             "This stage cannot run standalone: route requests through stage 0 "
             "(reasoner) via the stage router."
         )
 
-    def install_text_conditioning(self, payload: dict[str, Any]) -> Cosmos3TextConditioning:
-        """Load this rank's shard of the reasoner's conditioning into the stub."""
-        conditioning = Cosmos3TextConditioning.from_payload(payload)
+    def _replay_stub(self) -> _ReplayLanguageModel:
         stub = self.transformer.language_model
         if not isinstance(stub, _ReplayLanguageModel):
             raise RuntimeError(
                 "Cosmos3 generator stage is not running the replay UND stub; "
                 "the pipeline was not built by Cosmos3GeneratorPipeline."
             )
+        return stub
+
+    def install_text_conditioning(self, payload: dict[str, Any]) -> Cosmos3TextConditioning:
+        """Load this rank's shard of the reasoner's conditioning into the stub."""
+        conditioning = Cosmos3TextConditioning.from_payload(payload)
+        stub = self._replay_stub()
         stub.install(conditioning, dtype=self.transformer.proj_in.weight.dtype)
         logger.info(
             "Cosmos3 generator: installed reasoner K/V for %d branch(es) (%.1f MiB, "

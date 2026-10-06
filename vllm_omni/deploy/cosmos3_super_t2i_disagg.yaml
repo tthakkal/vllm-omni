@@ -113,9 +113,8 @@ stages:
   # too short to be worth splitting, it is traversed once rather than once per
   # denoising step, and the weights already fit on one card.
   #
-  # This stage also builds a VAE it never uses (~1 GiB), because it inherits
-  # Cosmos3OmniDiffusersPipeline.__init__ verbatim. Cheap, and worth far more
-  # than a forked copy of that constructor.
+  # This stage never decodes, so it reads only the VAE config (for the latent
+  # scale factors) and never loads the VAE weights.
   - stage_id: 0
     devices: "0"
     # One request in flight per stage. The two stages still pipeline across

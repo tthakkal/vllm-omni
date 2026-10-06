@@ -435,6 +435,136 @@ class TestTowerOwnership:
 
 
 # =============================================================================
+# VAE ownership
+# =============================================================================
+
+
+@pytest.fixture
+def stub_pipeline_loaders(monkeypatch: pytest.MonkeyPatch):
+    """Stub every loader the real ``Cosmos3OmniDiffusersPipeline.__init__`` calls,
+    recording whether the VAE was loaded with weights or only had its config read."""
+    from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+    vae_calls: list[str] = []
+
+    class _StubVAE:
+        config = SimpleNamespace(scale_factor_temporal=4, scale_factor_spatial=8)
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            vae_calls.append("from_pretrained")
+            return cls()
+
+        @classmethod
+        def load_config(cls, *args, **kwargs):
+            vae_calls.append("load_config")
+            return {"scale_factor_temporal": 4, "scale_factor_spatial": 8}
+
+        def to(self, *args, **kwargs):
+            return self
+
+    class _StubScheduler:
+        @classmethod
+        def load_config(cls, *args, **kwargs):
+            return {"_class_name": "UniPCMultistepScheduler"}
+
+        @classmethod
+        def from_config(cls, *args, **kwargs):
+            return SimpleNamespace(config=SimpleNamespace())
+
+    monkeypatch.setattr(pipeline_cosmos3, "AutoTokenizer", SimpleNamespace(from_pretrained=lambda *a, **k: None))
+    monkeypatch.setattr(pipeline_cosmos3, "DistributedAutoencoderKLWan", _StubVAE)
+    monkeypatch.setattr(pipeline_cosmos3, "FlowUniPCMultistepScheduler", _StubScheduler)
+    monkeypatch.setattr(pipeline_cosmos3, "VideoProcessor", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline_cosmos3, "get_local_device", lambda: torch.device("cpu"))
+    return vae_calls
+
+
+def _tiny_od_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        enable_cpu_offload=False,
+        enable_diffusion_pipeline_profiler=False,
+        enable_session_state_manager=False,
+        model="/nonexistent/model/path",
+        dtype=torch.float32,
+        flow_shift=None,
+        quantization_config=None,
+        custom_pipeline_args={},
+        model_config={},
+        tf_model_config={
+            "hidden_size": 8,
+            "num_hidden_layers": 0,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "head_dim": 4,
+            "intermediate_size": 16,
+            "vocab_size": 32,
+            "latent_patch_size": 1,
+            "latent_channel": 2,
+            "rope_scaling": {"mrope_section": [1, 1, 0]},
+        },
+        parallel_config=SimpleNamespace(cfg_parallel_size=1, ulysses_degree=1),
+    )
+
+
+class TestVaeOwnership:
+    """Only the generator decodes, so only the generator loads VAE weights."""
+
+    def test_only_the_reasoner_skips_the_vae(self):
+        assert Cosmos3ReasonerPipeline.cosmos3_loads_vae is False
+        assert Cosmos3GeneratorPipeline.cosmos3_loads_vae is True
+        assert Cosmos3OmniDiffusersPipeline.cosmos3_loads_vae is True
+
+    def test_reasoner_reads_only_the_vae_config(self, stub_pipeline_loaders):
+        pipeline = Cosmos3ReasonerPipeline(od_config=_tiny_od_config())
+
+        assert stub_pipeline_loaders == ["load_config"]
+        assert pipeline.vae is None
+        # The scale factors still come from the checkpoint's VAE config.
+        assert pipeline.vae_scale_factor_temporal == 4
+        assert pipeline.vae_scale_factor_spatial == 8
+
+    def test_colocated_pipeline_still_loads_the_vae_weights(self, stub_pipeline_loaders):
+        pipeline = Cosmos3OmniDiffusersPipeline(od_config=_tiny_od_config())
+
+        assert stub_pipeline_loaders == ["from_pretrained"]
+        assert pipeline.vae is not None
+        assert pipeline.vae_scale_factor_temporal == 4
+        assert pipeline.vae_scale_factor_spatial == 8
+
+    def test_reasoner_vae_config_without_temporal_factor_is_rejected(self, stub_pipeline_loaders, monkeypatch):
+        from vllm_omni.diffusion.models.cosmos3 import pipeline_cosmos3
+
+        monkeypatch.setattr(
+            pipeline_cosmos3.DistributedAutoencoderKLWan,
+            "load_config",
+            classmethod(lambda cls, *a, **k: {"scale_factor_spatial": 8}),
+        )
+
+        with pytest.raises(ValueError, match="scale_factor_temporal"):
+            Cosmos3ReasonerPipeline(od_config=_tiny_od_config())
+
+    def test_module_discovery_finds_no_vae_on_the_reasoner(self, stub_pipeline_loaders, caplog):
+        from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
+
+        pipeline = Cosmos3ReasonerPipeline(od_config=_tiny_od_config())
+
+        discovered = ModuleDiscovery.discover(pipeline)
+
+        assert discovered.vaes == []
+        assert "'vae'" not in caplog.text
+
+    def test_model_cpu_offload_tolerates_the_missing_vae(self, stub_pipeline_loaders, monkeypatch):
+        pipeline = Cosmos3ReasonerPipeline(od_config=_tiny_od_config())
+        calls: list[dict[str, Any]] = []
+        monkeypatch.setattr(pipeline.transformer, "enable_model_cpu_offload", lambda **kw: calls.append(kw))
+
+        pipeline.enable_omni_model_cpu_offload(device=torch.device("cpu"))
+
+        assert len(calls) == 1
+
+
+# =============================================================================
 # Cosmos3TextConditioning -- the typed contract on the edge
 # =============================================================================
 
@@ -1326,12 +1456,12 @@ class TestGeneratorPipeline:
 
         assert Cosmos3GeneratorPipeline._extract_und_payload(req) is payload
 
-    def test_extracts_the_payload_from_sampling_params(self):
-        """Fallback that mirrors GLM-Image's DiT stage; handy for direct driving."""
-        payload: dict[str, Any] = {KV_KEY: {"fp": []}}
-        req = SimpleNamespace(prompts=[{"prompt": "x"}], sampling_params=SimpleNamespace(extra_args=payload))
+    def test_the_payload_is_not_read_from_sampling_params(self):
+        """Only ``prompt["extra"]`` carries the handoff; ``extra_args`` is user input."""
+        req = SimpleNamespace(prompts=[{"prompt": "x"}], sampling_params=SimpleNamespace(extra_args={KV_KEY: {}}))
 
-        assert Cosmos3GeneratorPipeline._extract_und_payload(req) is payload
+        with pytest.raises(ValueError, match="without reasoner K/V"):
+            Cosmos3GeneratorPipeline._extract_und_payload(req)
 
     @pytest.mark.parametrize(
         "req",

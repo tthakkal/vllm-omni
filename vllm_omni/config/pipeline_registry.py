@@ -145,17 +145,14 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "bagel_single_stage": BAGEL_SINGLE_STAGE_PIPELINE,
     "bagel_think": BAGEL_THINK_PIPELINE,
     "breeze": BREEZE_TTS_2_PIPELINE,
-    # Two-stage Cosmos3 topology, one stage per Mixture-of-Transformers tower,
-    # over the same checkpoint as ``cosmos3_omni_deploy`` below. Opt-in like its
-    # siblings: selected only by an explicit `pipeline: cosmos3_omni_disagg` in
-    # the deploy YAML (see cosmos3_pipeline_config for why it declares no
-    # architectures).
-    "cosmos3_omni_disagg": COSMOS3_DISAGG_PIPELINE,
     # Cosmos3 policy / omni-deploy topologies share HF metadata with video
     # Cosmos3 checkpoints (which stay on the single-stage diffusion fallback),
     # so these entries are only reachable through a deploy yaml's ``pipeline:``
     # key (see deploy/cosmos3_policy_droid.yaml and deploy/cosmos3_omni.yaml).
     "cosmos3_omni_deploy": COSMOS3_OMNI_DEPLOY_PIPELINE,
+    # One stage per Mixture-of-Transformers tower; same opt-in rule as above
+    # (deploy/cosmos3_super_t2i_disagg.yaml).
+    "cosmos3_omni_disagg": COSMOS3_DISAGG_PIPELINE,
     "cosmos3_policy": COSMOS3_POLICY_PIPELINE,
     "cosyvoice3": resolve_cosyvoice3_pipeline,
     "covo_audio": COVO_AUDIO_PIPELINE,

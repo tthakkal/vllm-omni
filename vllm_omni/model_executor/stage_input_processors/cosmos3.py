@@ -75,9 +75,8 @@ def _find_und_payload(source_outputs: list[Any]) -> dict[str, Any] | None:
 
     The reasoner's postprocessor parks the K/V under the ``trajectory`` payload
     key, and ``output_formatter._build_multimodal_output`` copies ``trajectory``
-    verbatim into ``multimodal_output`` -- so the canonical location is
-    ``multimodal_output["trajectory"][KV_KEY]``. The un-nested form is accepted
-    too, for driving this bridge directly from a hand-built payload in a test.
+    verbatim into ``multimodal_output`` -- so the payload is at
+    ``multimodal_output["trajectory"][KV_KEY]``.
 
     Both the ``RequestOutput`` and the inner ``CompletionOutput`` are probed
     because ``multimodal_output`` is a dynamic attribute on both: the connector
@@ -91,8 +90,6 @@ def _find_und_payload(source_outputs: list[Any]) -> dict[str, Any] | None:
             mm = getattr(holder, "multimodal_output", None)
             if not isinstance(mm, dict):
                 continue
-            if KV_KEY in mm:
-                return mm
             trajectory = mm.get("trajectory")
             if isinstance(trajectory, dict) and KV_KEY in trajectory:
                 return trajectory
@@ -124,6 +121,9 @@ def reasoner2generator(
         # The generator stage re-runs _is_t2i_request, which keys purely off this
         # list, so it has to be restated here.
         "modalities": ["image"],
+        # Stage-handoff only: the diffusion output formatter drops ``extra`` from
+        # the prompt it echoes on ``OmniRequestOutput``, so the K/V does not reach
+        # the caller.
         "extra": {
             KV_KEY: payload[KV_KEY],
             META_KEY: meta,

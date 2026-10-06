@@ -55,17 +55,16 @@ def _reasoner_output(
     table: dict[str, list] | None = None,
     meta: dict[str, Any] | None = None,
     *,
-    nested: bool = True,
     on_completion: bool = False,
 ):
     """Build a reasoner ``RequestOutput`` in one of the envelopes seen in practice.
 
-    ``nested`` mirrors what the output formatter actually produces (the payload
-    under the ``trajectory`` key); ``on_completion`` mirrors the external-transport
-    path, where the payload is promoted onto the inner completion output.
+    The payload sits under the ``trajectory`` key, as the output formatter
+    produces it; ``on_completion`` mirrors the external-transport path, where the
+    payload is promoted onto the inner completion output.
     """
     payload = {KV_KEY: table if table is not None else _kv_table(), META_KEY: meta if meta is not None else _meta()}
-    mm = {"trajectory": payload} if nested else dict(payload)
+    mm = {"trajectory": payload}
     if on_completion:
         return SimpleNamespace(multimodal_output=None, outputs=[SimpleNamespace(multimodal_output=mm)])
     return SimpleNamespace(multimodal_output=mm, outputs=[SimpleNamespace(multimodal_output=None)])
@@ -103,15 +102,20 @@ class TestAsDict:
 
 
 class TestFindUndPayload:
-    @pytest.mark.parametrize("nested", [True, False])
     @pytest.mark.parametrize("on_completion", [True, False])
-    def test_locates_payload_in_every_envelope(self, nested: bool, on_completion: bool):
-        output = _reasoner_output(nested=nested, on_completion=on_completion)
+    def test_locates_payload_in_every_envelope(self, on_completion: bool):
+        output = _reasoner_output(on_completion=on_completion)
 
         payload = _find_und_payload([output])
 
         assert payload is not None
         assert KV_KEY in payload
+
+    def test_ignores_a_payload_outside_the_trajectory_key(self):
+        """The formatter only forwards ``trajectory``; nothing else is a handoff."""
+        output = SimpleNamespace(multimodal_output={KV_KEY: _kv_table(), META_KEY: _meta()}, outputs=[])
+
+        assert _find_und_payload([output]) is None
 
     def test_no_multimodal_output(self):
         assert _find_und_payload([SimpleNamespace(multimodal_output=None, outputs=[])]) is None

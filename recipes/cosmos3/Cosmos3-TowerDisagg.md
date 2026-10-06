@@ -188,10 +188,12 @@ Three consequences worth knowing:
   twice per request.
 - **Each stage owns one tower.** The unowned tower is never constructed, so its
   parameters are never allocated on the card — the split does not construct both
-  and prune one.
+  and prune one. The same goes for the VAE: only the generator decodes, so the
+  reasoner reads just the VAE config and never loads its weights.
 
 The split saves device memory, not startup I/O: both stages still stream the
-whole checkpoint and filter the other tower's tensors out after reading them.
+whole transformer checkpoint and filter the other tower's tensors out after
+reading them.
 Expect roughly double the aggregate startup read I/O of the co-located layout.
 
 ## What has been measured
@@ -202,9 +204,9 @@ On 2×H200 (141 GB), Cosmos3-Super-Text2Image at 1024×1024, 50 steps, guidance
 | Layout | Peak device memory | Image |
 | --- | --- | --- |
 | co-located, TP 1 | 121.56 GiB on one card | baseline |
-| **disaggregated, TP 1** | **63.43 GiB / 62.04 GiB per stage** | byte-identical to baseline |
+| **disaggregated, TP 1** | **62.10 GiB / 62.04 GiB per stage** | byte-identical to baseline |
 | co-located, TP 2 | 63.78 GiB per rank | baseline' |
-| **disaggregated, TP 2** | **34.52 GiB / 33.13 GiB per rank** | byte-identical to baseline' |
+| **disaggregated, TP 2** | **33.19 GiB / 33.13 GiB per rank** | byte-identical to baseline' |
 
 The tower split is numerically transparent: the images match bit for bit at both
 TP sizes, offline and through `/v1/images/generations`. Compare like with like:
