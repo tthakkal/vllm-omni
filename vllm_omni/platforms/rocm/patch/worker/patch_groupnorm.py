@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Patch ``initialize_model`` to replace VAE GroupNorm with AITER GroupNorm on ROCm."""
 
@@ -43,6 +44,13 @@ def _patched_initialize_model(od_config):
 
     # ``vae`` may be ``None`` on a stage that never decodes (Cosmos3's reasoner).
     if getattr(model, "vae", None) is not None:
+        # AITER GroupNorm does not preserve the PyTorch autocast behavior required
+        # by Hunyuan Image 3.0. Keep PyTorch GroupNorm until the fix is released:
+        # https://github.com/ROCm/aiter/issues/4780
+        # https://github.com/ROCm/aiter/pull/4779
+        if od_config.model_class_name == "HunyuanImage3ForCausalMM":
+            return model
+
         try:
             from vllm._aiter_ops import is_aiter_found_and_supported
 
