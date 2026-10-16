@@ -3,6 +3,7 @@
 import ast
 import asyncio
 import base64
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -70,6 +71,17 @@ def test_buffer_refuses_video_frames_and_points_at_the_openai_interface():
     committed = buffer.prepare_commit(operation_id="second-commit", chunk_period_ms=200)
     assert "video_frames" not in committed.payload
     committed.commit()
+
+
+def test_capabilities_advertise_image_items_not_append_frames():
+    """Clients choose how to send frames from these fields; they must match the buffer's refusal."""
+    caps = Qwen3OmniDuplexPlugin(lambda audio, *args: "AAAA").capabilities(max_sessions=1)
+    assert caps.supports_image_input
+    assert not caps.accepts_input_modality("video")
+    assert caps.validate_append_modalities(has_audio=True, has_video=True) == (
+        "This duplex model does not accept video_frames"
+    )
+    assert caps.validate_append_modalities(has_audio=True, has_video=False) is None
 
 
 async def open_qwen():
@@ -957,5 +969,27 @@ async def test_visual_capture_records_submitted_pixels_and_request(tmp_path, mon
             actual = submission.prompt["multi_modal_data"]["image"][0]
             assert saved.size == actual.size
             assert saved.tobytes() == actual.tobytes()
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_listen_audio_commit_does_not_use_video_deferred_response():
+    h = await open_qwen()
+    try:
+        await h.run(UpdateSession(patch={"turn_detection": None}))
+        await h.run(append_audio())
+        await h.run(Commit(final=True, create_response=True))
+        request_id = h.port.submissions[-1].context.request_id
+        response_id = h.session.active_response_id
+        await h.run(replace(append_audio(), hints={"overlap_action": "listen"}))
+        await h.run(Commit(final=True, create_response=True))
+        assert not h.runner.model_state.deferred_response_create
+        assert h.runner.model_state.committed_audio_payload is None
+        assert h.runner.model_state.audio_buffer.has_pending()
+        await h.deliver_and_settle(tts_output(request_id, text="Hello", finished=True), stage_id=0)
+        await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2)
+        await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+        assert len(h.port.submissions) == 1
     finally:
         await h.manager.shutdown()

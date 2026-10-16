@@ -77,7 +77,6 @@ class _FakeTalker:
         self,
         text_token,
         last_agent,
-        prev_agent,
         device,
         user_d0=None,
         user_d1=None,
@@ -86,7 +85,6 @@ class _FakeTalker:
             {
                 "text_token": text_token.clone(),
                 "last_agent": None if last_agent is None else last_agent.clone(),
-                "prev_agent": None if prev_agent is None else prev_agent.clone(),
                 "user_d0": None if user_d0 is None else user_d0.clone(),
                 "user_d1": None if user_d1 is None else user_d1.clone(),
             }
@@ -221,7 +219,6 @@ def test_frame_embed_uses_previous_effective_agent_frame() -> None:
         fake_talker,
         torch.tensor([3]),
         last_agent,
-        torch.arange(8),
         torch.device("cpu"),
     )
 
@@ -245,32 +242,30 @@ def test_repeated_append_identity_does_not_advance_codec() -> None:
 def test_next_append_uses_prior_sample_and_causally_delayed_user_frame() -> None:
     runtime = _runtime(_FakeCodec())
 
-    runtime.prepare_append(_duplex_info(seq=1), prompt_len=18, request_id="req")
-    first_agent = torch.arange(8, dtype=torch.long)
-    runtime.record_sample(request_id="req", text_token=torch.tensor(101), agent_codes=first_agent)
-    runtime.prepare_append(_duplex_info(seq=2), prompt_len=19, request_id="req")
-    second_agent = torch.arange(10, 18, dtype=torch.long)
-    runtime.record_sample(request_id="req", text_token=torch.tensor(102), agent_codes=second_agent)
-    runtime.prepare_append(_duplex_info(seq=3), prompt_len=20, request_id="req")
-
     silence = torch.tensor(SILENCE_TOKENS, dtype=torch.long)
     sine = torch.tensor(SINE_TOKENS, dtype=torch.long)
+    runtime.prepare_append(_duplex_info(seq=1), prompt_len=18, request_id="req")
+    # The first append teacher-forces agent cb1..7 to silence.
+    expected_first_effective = torch.cat([torch.tensor([0]), silence[1:]])
+    runtime.record_sample(request_id="req", text_token=torch.tensor(101), effective_codes=expected_first_effective)
+    runtime.prepare_append(_duplex_info(seq=2), prompt_len=19, request_id="req")
+    second_agent = torch.arange(10, 18, dtype=torch.long)
+    runtime.record_sample(request_id="req", text_token=torch.tensor(102), effective_codes=second_agent)
+    runtime.prepare_append(_duplex_info(seq=3), prompt_len=20, request_id="req")
+
     first_call = runtime.stage_model.frame_calls[0]
-    assert all(torch.equal(first_call[key], silence) for key in ("last_agent", "prev_agent"))
+    assert torch.equal(first_call["last_agent"], silence)
     assert all(torch.equal(first_call[key], sine) for key in ("user_d0", "user_d1"))
 
     second_call = runtime.stage_model.frame_calls[1]
     assert second_call["text_token"].tolist() == [101]
-    expected_first_effective = torch.cat([first_agent[:1], silence[1:]])
     assert torch.equal(second_call["last_agent"], expected_first_effective)
-    assert torch.equal(second_call["prev_agent"], expected_first_effective)
     assert torch.equal(second_call["user_d0"], torch.full((8,), 1, dtype=torch.long))
     assert torch.equal(second_call["user_d1"], sine)
 
     third_call = runtime.stage_model.frame_calls[2]
     assert third_call["text_token"].tolist() == [102]
     assert torch.equal(third_call["last_agent"], second_agent)
-    assert torch.equal(third_call["prev_agent"], second_agent)
     assert torch.equal(third_call["user_d0"], torch.full((8,), 2, dtype=torch.long))
     assert torch.equal(third_call["user_d1"], torch.full((8,), 1, dtype=torch.long))
 
@@ -468,7 +463,7 @@ def test_cancel_overlap_full_processing_order_never_re_leases_the_aborted_epoch(
         else:
             restarted = runtime.prepare_append(duplex, prompt_len=prompt_len, request_id=request_id)
     for request_id in ("req-e0", "req-e1"):
-        runtime.record_sample(request_id=request_id, text_token=5, agent_codes=list(range(8)))
+        runtime.record_sample(request_id=request_id, text_token=5, effective_codes=list(range(8)))
     runtime.close_request("req-e0")  # the engine's late finish of the aborted request
 
     assert list(runtime.sessions) == [("session", 1)]
