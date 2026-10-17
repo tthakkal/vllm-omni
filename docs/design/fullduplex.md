@@ -179,7 +179,8 @@ vllm_omni/
 │   │   ├── realtime_input.py        RealtimeEnvelope (query rules, first message), parse_resume_request
 │   │   ├── session_attachment.py    DuplexSessionAttachmentRegistry (resume tokens, replay journal)
 │   │   ├── audio_encoding.py        encode_audio, injected into DuplexOmniEngine for the plugin's data plane
-│   │   ├── chat_completions.py      DuplexChatCompletionsAdapter (/v1/chat/completions on a session per request)
+│   │   ├── openai.py                dispatch_realtime_websocket (turn-based /v1/realtime, when duplex mode is not selected)
+│   │   ├── warmup.py                startup warmup probe; wait_for_duplex_warmup holds clients until it finishes
 │   │   └── websocket.py             websocket send/close/receive helpers
 │   └── openai/api_server.py         builds DuplexOmni for duplex models; session-backed app state
 ├── protocol/                        SHARED WIRE CODEC (no engine / no model / no transport)
@@ -244,6 +245,9 @@ vllm_omni/
 ├── config/stage_config.py           PipelineConfig.duplex_plugin; DuplexSessionRuntimeConfig
 ├── model_executor/models/minicpmo_4_5/duplex/plugin.py   MiniCPMO45DuplexPlugin (+ data_plane, input, policy, ...)
 ├── model_executor/models/nemotron_voicechat/duplex/plugin.py   NemotronVoiceChatDuplexPlugin (+ data_plane, input, capabilities)
+├── model_executor/models/personaplex/duplex/plugin.py   PersonaPlexDuplexPlugin (+ stage0, data_plane, input, policy)
+├── model_executor/models/qwen3_omni/duplex/plugin.py   Qwen3OmniDuplexPlugin (+ input, session)
+├── model_executor/models/aura_omni/duplex/plugin.py   AuraDuplexPlugin
 └── clients/
     ├── duplex.py                    DuplexClientBase (ABC), DuplexClient (websocket), client-side events
     ├── inline_duplex.py             InlineDuplexClient (in-process, over DuplexOmni)
@@ -448,6 +452,28 @@ Frame-based plugins use `engine/duplex/intermediate.py::build_duplex_append_prom
 for the shared request identity, sequencing and config snapshots. Token budgets,
 PCM framing and model-specific worker fields remain in the plugins.
 
+Turn plugins may bind their stage identities in `configure_pipeline` and select
+an append's entry with `input_stage_id(payload)` (default 0). The request context
+and orchestrator retain that entry stage. Session prompt preparation receives
+the request's complete `stage_sampling_params`, so a pipeline with an ASR prefix
+budgets the JoyAI prompt against JoyAI's generation settings. Session model config
+comes from the first tokenizer-owning stage, matching frontend comprehension
+ownership. JoyAI's audio-free requests enter its `joyvl` stage directly; speech
+enters ASR and carries the original observation context through the handoff.
+
+While idle, JoyAI retains the latest camera frame and one input chunk of audio
+pre-roll. Once speech starts, it keeps the utterance until commit. An idle
+camera commit enters JoyAI directly; reserved-byte accounting includes the
+pre-roll until the commit is consumed or rolled back.
+
+Completed input transcriptions travel with stage outputs through the runner
+mailbox. After checking the request fence, the runner updates the exact committed
+audio history item and emits its transcription event. The append captures the
+original native audio part before yielding and retains that identity on its
+request resource; a reused public item ID does not confer transcript ownership.
+Cancellation, item deletion or replacement cannot apply a late transcript to a
+newer turn.
+
 See [supported models and deployments](../serving/full_duplex_api.md#enable-full-duplex)
 for the current plugin integrations and deployment configurations.
 
@@ -486,7 +512,8 @@ for the current plugin integrations and deployment configurations.
   `tests/entrypoints/openai/test_duplex_session_attachment.py`,
   `tests/entrypoints/openai_api/test_duplex_api_server.py` (the duplex
   server: pipeline probe, app state, routes, warmup gate),
-  `tests/entrypoints/duplex/test_chat_completions_adapter.py`,
+  `tests/entrypoints/duplex/test_duplex_warmup.py`,
+  `tests/entrypoints/duplex/test_startup_warmup.py`,
   `tests/clients/**`, `tests/engine/test_duplex_import_boundary.py`,
   `tests/model_executor/models/minicpmo_4_5/duplex/**`,
   `tests/worker/test_native_duplex_hooks.py`.
