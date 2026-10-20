@@ -1138,7 +1138,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         if has_padding or sp_padding:
             return "mask"
         backend = self.transformer_blocks[0].attn.attn.attn_backend
-        if backend is not None and backend.supports_piecewise_spans:
+        if backend is not None and backend.supports_piecewise_spans():
             return "piecewise"
         return "mask"
 

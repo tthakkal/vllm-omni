@@ -175,8 +175,11 @@ class VDNAttentionBackend(FlashAttentionBackend):
     """``FLASH_ATTN`` plus the VDN-H3 window for layers that publish one."""
 
     supports_paged_kv: bool = False
-    supports_piecewise_spans: bool = False
     supported_platforms = ("cuda",)
+
+    @classmethod
+    def supports_piecewise_spans(cls) -> bool:
+        return False
 
     @classmethod
     def supports_multi_doc_packed_varlen(cls) -> bool:

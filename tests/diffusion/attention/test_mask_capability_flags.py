@@ -10,10 +10,12 @@ equivalent ``attn_mask`` and run unmasked dense attention with no error and no w
 so these flags are asserted per platform rather than once per class.
 """
 
+import sys
 from dataclasses import dataclass
 
 import pytest
 import torch
+from torch import nn
 
 from vllm_omni.diffusion.attention.backends.abstract import (
     AttentionBackend,
@@ -25,6 +27,7 @@ from vllm_omni.diffusion.attention.backends.flash_attn_hub import (
     FlashAttention3HubBackend,
     FlashAttentionHubBackend,
 )
+from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
@@ -250,3 +253,82 @@ def test_piecewise_assert_accepts_spans_with_4d_mask():
         attn_mask=torch.ones(1, 1, 4, 4, dtype=torch.bool),
     )
     Attention._assert_piecewise_compatible(layer, metadata)
+
+
+class _RecordingImpl:
+    """Records which impl ``_run_local_attention`` dispatched to."""
+
+    def __init__(self, name: str, calls: list[str]) -> None:
+        self.name = name
+        self.calls = calls
+
+    def forward(self, query, key, value, attn_metadata):
+        self.calls.append(self.name)
+        return query
+
+
+def _flash_layer(calls: list[str]) -> Attention:
+    """A real ``Attention`` carrying only what ``_run_local_attention`` reads on this path.
+
+    Built without ``__init__`` because that resolves a backend for the host platform; the point
+    here is to run the real dispatch with FLASH_ATTN as resolved on the patched platform.
+    """
+    layer = Attention.__new__(Attention)
+    nn.Module.__init__(layer)
+    layer.attn_backend = FlashAttentionBackend
+    layer.attention = _RecordingImpl("flash", calls)
+    layer.sdpa_fallback = _RecordingImpl("sdpa", calls)
+    layer.allow_fp32_fallback = False
+    layer.backend_explicit = False
+    layer._scheduler_paged_kv = False
+    layer.paged_kv_cache_role = None
+    return layer
+
+
+@pytest.mark.parametrize(
+    ("platform", "mask", "spans", "expected"),
+    [
+        # The fix: XPU flash would hit forward_xpu's 2D assert, so >2D masks run on SDPA.
+        # HunyuanImage3 / glm_image / flux / flux2 / ernie_image all pass 4D masks here.
+        ("xpu", torch.ones(1, 1, 4, 4, dtype=torch.bool), None, "sdpa"),
+        ("xpu", torch.ones(1, 1, 4, 4, dtype=torch.bool), [[(0, 4)]], "sdpa"),
+        ("xpu", torch.ones(1, 4, 4, dtype=torch.bool), None, "sdpa"),
+        # A 2D padding mask is what forward_xpu's varlen route accepts; keep flash.
+        ("xpu", torch.ones(1, 4, dtype=torch.bool), None, "flash"),
+        ("xpu", None, None, "flash"),
+        # CUDA keeps HunyuanImage3's 4D mask + spans on flash so it reaches piecewise_attn.
+        ("cuda", torch.ones(1, 1, 4, 4, dtype=torch.bool), [[(0, 4)]], "flash"),
+        # NPU hands 4D masks to aclnnFlashAttentionScore directly.
+        ("npu", torch.ones(1, 1, 4, 4, dtype=torch.bool), None, "flash"),
+    ],
+)
+def test_run_local_attention_dispatches_dense_mask(monkeypatch, platform, mask, spans, expected):
+    monkeypatch.setattr(f"{_BACKEND_MODULES[FlashAttentionBackend]}.current_omni_platform", _Platform(platform))
+    calls: list[str] = []
+    layer = _flash_layer(calls)
+    q = torch.zeros(1, 4, 2, 8)
+    metadata = AttentionMetadata(attn_mask=mask, full_attn_spans=spans)
+
+    Attention._run_local_attention(layer, q, q, q, metadata)
+
+    assert calls == [expected]
+
+
+@pytest.mark.parametrize("backend_enum", list(DiffusionAttentionBackendEnum), ids=lambda e: e.name)
+@pytest.mark.parametrize("platform", _PLATFORMS)
+def test_every_registered_backend_answers_flags_as_callables(monkeypatch, backend_enum, platform):
+    """No backend may shadow a capability classmethod with a plain class attribute.
+
+    ``supports_piecewise_spans: bool = True`` on a subclass replaces the base classmethod with
+    a ``bool``, so every ``supports_piecewise_spans()`` call raises ``TypeError`` -- and a
+    caller that forgets the ``()`` instead reads a bound method, which is always truthy.
+    """
+    try:
+        backend = backend_enum.get_class()
+    except ImportError as exc:
+        pytest.skip(f"{backend_enum.name} is not importable here: {exc}")
+    module = backend.__module__
+    if hasattr(sys.modules[module], "current_omni_platform"):
+        monkeypatch.setattr(f"{module}.current_omni_platform", _Platform(platform))
+    for flag in ("supports_piecewise_spans", "supports_dense_attention_mask"):
+        assert isinstance(getattr(backend, flag)(), bool), f"{backend_enum.name}.{flag}"

@@ -18,10 +18,16 @@ accelerator itself, because a mask this large is assembled by device kernels who
 the CPU cases cannot stand in for.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from tests.helpers.mark import hardware_test
+from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend
+from vllm_omni.diffusion.models.hidream_o1_image.hidream_o1_image_transformer import (
+    HiDreamO1ImageTransformer,
+)
 from vllm_omni.diffusion.models.hidream_o1_image.pipeline_hidream_o1_image import (
     build_hidream_o1_attention_mask,
 )
@@ -113,6 +119,47 @@ def test_accepts_1d_and_column_token_types(shape):
 def test_rejects_higher_rank_token_types():
     with pytest.raises(ValueError, match="one or two dimensions"):
         build_hidream_o1_attention_mask(torch.zeros(1, 1, 8, dtype=torch.long), dtype=torch.bfloat16)
+
+
+class _SpansOn(AttentionBackend):
+    @classmethod
+    def supports_piecewise_spans(cls) -> bool:
+        return True
+
+
+class _SpansOff(AttentionBackend):
+    """Like FLASH_ATTN on XPU / NPU, where forward ignores ``full_attn_spans``."""
+
+    @classmethod
+    def supports_piecewise_spans(cls) -> bool:
+        return False
+
+
+def _transformer_with_backends(*backends: type[AttentionBackend]) -> SimpleNamespace:
+    """Just the ``model.language_model.layers[i].self_attn.attn.attn_backend`` chain the probe walks."""
+    layers = [SimpleNamespace(self_attn=SimpleNamespace(attn=SimpleNamespace(attn_backend=b))) for b in backends]
+    return SimpleNamespace(model=SimpleNamespace(language_model=SimpleNamespace(layers=layers)))
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("backends", "expected"),
+    [
+        ((_SpansOn, _SpansOn), True),
+        ((_SpansOff, _SpansOff), False),
+        # One layer that cannot carry spans is enough to need the mask everywhere.
+        ((_SpansOn, _SpansOff), False),
+    ],
+)
+def test_supports_piecewise_attention_calls_the_backend_probe(backends, expected):
+    """The pipeline builds the 4D mask only when this property is False.
+
+    ``supports_piecewise_spans`` is a method; reading it without ``()`` yields a bound method,
+    which is truthy, so ``all(...)`` would be True on every platform and the pipeline would skip
+    the mask -- silently running HiDream's text rows with full attention on XPU / NPU.
+    """
+    stub = _transformer_with_backends(*backends)
+    assert HiDreamO1ImageTransformer.supports_piecewise_attention.fget(stub) is expected
 
 
 @hardware_test(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"})

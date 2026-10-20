@@ -16,7 +16,11 @@ from vllm_omni.diffusion.attention.backends.utils.piecewise_attn import piecewis
 class CuDNNAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
     supports_prefix_kv_slicing: bool = True
-    supports_piecewise_spans: bool = True
+
+    @classmethod
+    def supports_piecewise_spans(cls) -> bool:
+        # CUDA-only backend; forward_cuda dispatches piecewise_attn.
+        return True
 
     # cuDNN 9.5+ FMHA on Blackwell: head_dim divisible by 8 and at most 256
     # for BF16/FP16. Used by automatic platform selection; explicit CUDNN_ATTN
