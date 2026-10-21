@@ -30,6 +30,7 @@ from typing import Literal
 import pytest
 import torch
 
+from tests.helpers.distributed import collective_context, configure_cpu_collective_worker, start_collective_workers
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.data import (
     AttentionConfig,
@@ -39,7 +40,7 @@ from vllm_omni.diffusion.data import (
     TransformerConfig,
 )
 
-_TWO_CARD = hardware_marks(res={"cuda": "L4", "rocm": "MI325", "xpu": "B60"}, num_cards=2)
+_TWO_CARD = hardware_marks(res={"cuda": ["L4", "B200"], "rocm": "MI325", "xpu": "B60"}, num_cards=2)
 
 DeviceKind = Literal["cpu", "device"]
 
@@ -281,6 +282,9 @@ def _run_rank(
     checkpoint: dict[str, torch.Tensor],
     result_queue,
 ) -> None:
+    if device_kind == "cpu":
+        # Rank 1 must not resolve LOCAL_RANK=1 against visible GPUs on 1-GPU hosts.
+        configure_cpu_collective_worker()
     with _worker_vllm_config(device_kind):
         device = _init_dist(local_rank, world_size, master_port, device_kind)
         try:
@@ -306,14 +310,15 @@ def _spawn_ranks(
     sharded: bool,
     checkpoint: dict[str, torch.Tensor],
 ) -> list[dict]:
-    mp_context = torch.multiprocessing.get_context("spawn")
-    queue = mp_context.Manager().Queue()
-    torch.multiprocessing.spawn(
-        _run_rank,
-        args=(world_size, _find_free_port(), device_kind, sharded, checkpoint, queue),
-        nprocs=world_size,
-    )
-    reports = [queue.get() for _ in range(world_size)]
+    with collective_context(device_kind).Manager() as manager:
+        queue = manager.Queue()
+        start_collective_workers(
+            _run_rank,
+            args=(world_size, _find_free_port(), device_kind, sharded, checkpoint, queue),
+            nprocs=world_size,
+            device_kind=device_kind,
+        )
+        reports = [queue.get() for _ in range(world_size)]
     return sorted(reports, key=lambda report: report["rank"])
 
 

@@ -120,6 +120,8 @@ Enabling values are `1`, `true`, `yes` and `on`; anything else — including uns
 `tensor_parallel_size=2` (28 steps, 1024x1024, BF16) this cut denoise step latency ~10%
 and peak memory ~12%; the gain varies with resolution, step count, and TP degree.
 
+The flag applies to every pipeline built on these blocks: `FluxPipeline` (FLUX.1-dev, FLUX.1-schnell, and its DMD2 variant) and `FluxKontextPipeline` (FLUX.1-Kontext-dev). Only FLUX.1-dev was measured above; validate output quality and latency on the others before enabling it.
+
 It is opt-in because the sharded path uses its own checkpoint split loader, validated on
 unquantized checkpoints and on per-tensor/per-channel FP8 scales. Layouts it cannot split
 (a parameter missing on the split projections, or GPTQ/AWQ act-order group indices) raise
