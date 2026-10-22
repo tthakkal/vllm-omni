@@ -514,6 +514,65 @@ steps:
             "$$STABLE_AUDIO_OFFLOAD_ARTIFACT_DIR/pytest-summary.txt"
 
 
+  - group: ":full_moon: Wan2.2 Accuracy MI300 Nightly"
+    steps:
+      - label: "Wan2.2 I2V Accuracy 2 GPU"
+        agent_pool: mi300_2
+        mirror_hardwares: [amdproduction]
+        grade: NonBlocking
+        timeout_in_minutes: 180
+        env:
+          DIFFUSION_ATTENTION_BACKEND: TORCH_SDPA
+        artifact_paths:
+          - artifacts/rocm-wan22-accuracy-2gpu/**/*
+        commands:
+          - export ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-wan22-accuracy-2gpu"
+          - mkdir -p "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR"
+          # Offline generation is cards_1. Run it in this pod before the
+          # cards_2 online generation and comparison. A missing baseline fails.
+          - |
+            marker="full_model and diffusion and rocm and MI325 and (cards_1 or cards_2)"
+            nodes=(
+              "tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py::test_wan22_i2v_diffusers_offline_generates_video"
+              "tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py::test_wan22_i2v_online_serving_generates_video"
+              "tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py::test_wan22_i2v_serving_matches_diffusers_video_similarity"
+            )
+            pytest --collect-only -q "$${nodes[@]}" \
+              -m "$$marker" --run-level full_model \
+              > "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/collection.txt"
+            for node in "$${nodes[@]}"; do
+              if ! grep -Fq "$$node" "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/collection.txt"; then
+                echo "Wan2.2 accuracy node was not collected: $$node" >&2
+                cat "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/collection.txt" >&2
+                exit 5
+              fi
+            done
+            collected_count=$$(grep -c '::' "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/collection.txt" || true)
+            if [[ "$$collected_count" != 3 ]]; then
+              echo "Expected exactly three Wan2.2 accuracy nodes, found $$collected_count." >&2
+              cat "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/collection.txt" >&2
+              exit 5
+            fi
+          - |
+            set +e
+            marker="full_model and diffusion and rocm and MI325 and (cards_1 or cards_2)"
+            timeout --signal=TERM --kill-after=2m 165m \
+              pytest -s -v \
+              "tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py::test_wan22_i2v_diffusers_offline_generates_video" \
+              "tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py::test_wan22_i2v_online_serving_generates_video" \
+              "tests/e2e/accuracy/wan22_i2v/test_wan22_i2v_video_similarity.py::test_wan22_i2v_serving_matches_diffusers_video_similarity" \
+              -m "$$marker" --run-level full_model \
+              --junitxml="$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/pytest.xml" \
+              2>&1 | tee "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/pytest.log"
+            status=$${PIPESTATUS[0]}
+            set -e
+            if [[ -d tests/e2e/accuracy/wan22_i2v/result ]]; then
+              mkdir -p "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/result"
+              cp -a tests/e2e/accuracy/wan22_i2v/result/. \
+                "$$ROCM_WAN22_ACCURACY_2GPU_ARTIFACT_DIR/result/"
+            fi
+            exit "$$status"
+
   - group: ":full_moon: HunyuanImage3 LoRA MI300 Nightly"
     steps:
       - label: "HunyuanImage3 LoRA Accuracy"
