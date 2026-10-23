@@ -166,9 +166,9 @@ def test_inventory_matches_reviewed_snapshot_counts():
     assert category_counts == {
         EnvironmentVariableCategory.PUBLIC_OMNI: 33,
         EnvironmentVariableCategory.INHERITED_VLLM: 21,
-        EnvironmentVariableCategory.PLATFORM_EXTERNAL: 29,
-        EnvironmentVariableCategory.MODEL_SPECIFIC: 96,
-        EnvironmentVariableCategory.BENCHMARK_TRANSITIONAL: 21,
+        EnvironmentVariableCategory.PLATFORM_EXTERNAL: 31,
+        EnvironmentVariableCategory.MODEL_SPECIFIC: 98,
+        EnvironmentVariableCategory.BENCHMARK_TRANSITIONAL: 23,
         EnvironmentVariableCategory.INTERNAL: 5,
     }
 
@@ -178,7 +178,7 @@ def test_inventory_matches_reviewed_snapshot_counts():
         if item.category is EnvironmentVariableCategory.MODEL_SPECIFIC
     )
     assert {disposition: disposition_counts[disposition] for disposition in ModelEnvironmentVariableDisposition} == {
-        ModelEnvironmentVariableDisposition.PROMOTE: 68,
+        ModelEnvironmentVariableDisposition.PROMOTE: 70,
         ModelEnvironmentVariableDisposition.REQUEST_SCOPE: 5,
         ModelEnvironmentVariableDisposition.EXTERNAL: 0,
         ModelEnvironmentVariableDisposition.INTERNALIZE: 16,
