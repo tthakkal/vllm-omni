@@ -218,9 +218,9 @@ class OmniARModelRunner(OmniGPUModelRunner):
         num_sampled, num_rejected = sampling_output.num_sampled, sampling_output.num_rejected
         if sampling_output.multimodal_outputs is not None:
             multimodal_outputs = sampling_output.multimodal_outputs
-        run_eager_mtp = getattr(self.model_state, "run_eager_mtp", None)
-        if multimodal_outputs and run_eager_mtp is not None:
-            run_eager_mtp(
+        post_sample = getattr(self.model_state, "post_sample", None)
+        if post_sample is not None:
+            post_sample(
                 input_batch,
                 text_hidden,
                 sampler_output.sampled_token_ids,
@@ -535,9 +535,10 @@ def _async_copy_tensor(
         pin_memory = PIN_MEMORY
     cpu = torch.empty_like(x, device="cpu", pin_memory=pin_memory)
     cpu.copy_(x, non_blocking=pin_memory)
-    if copy_stream is None:
-        copy_stream = torch.cuda.current_stream()
-    x.record_stream(copy_stream)
+    if pin_memory:
+        if copy_stream is None:
+            copy_stream = torch.cuda.current_stream()
+        x.record_stream(copy_stream)
     return cpu
 
 
